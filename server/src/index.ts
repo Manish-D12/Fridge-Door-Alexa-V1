@@ -1,15 +1,26 @@
 import { loadConfig } from './config.js';
 import { createApp } from './http/app.js';
+import { Extractor } from './extract/extractor.js';
 import { createLogger } from './lib/logger.js';
+import { createLlmProvider } from './llm/index.js';
 import { ObligationService } from './service/obligations.js';
 import { createStore } from './store/index.js';
 
 const config = loadConfig();
 const logger = createLogger(config.LOG_LEVEL);
 const store = createStore(config);
+
+let extractor: Extractor | undefined;
+try {
+  extractor = new Extractor(createLlmProvider(config), config.HOUSEHOLD_TIMEZONE);
+} catch (err) {
+  logger.warn('extraction disabled; ingest_text and ingest_image will report it', { provider: config.LLM_PROVIDER, reason: (err as Error).message });
+}
+
 const service = new ObligationService(store, {
   timeZone: config.HOUSEHOLD_TIMEZONE,
   defaultCurrency: config.DEFAULT_CURRENCY,
+  extractor,
 });
 
 const app = createApp({ config, service, logger });
@@ -20,6 +31,7 @@ const server = app.listen(config.PORT, config.HOST, () => {
     api: `http://${config.HOST}:${config.PORT}/api`,
     storage: store.describe(),
     timeZone: config.HOUSEHOLD_TIMEZONE,
+    extraction: extractor?.providerName ?? 'disabled',
     auth: config.API_KEY ? 'bearer' : 'none',
   });
 });

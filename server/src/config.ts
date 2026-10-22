@@ -28,6 +28,12 @@ const EnvSchema = z.object({
   /** If set, /mcp and /api require `Authorization: Bearer <API_KEY>`. */
   API_KEY: z.string().min(16).optional(),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  /** Model used by ingest_text / ingest_image. */
+  LLM_PROVIDER: z.enum(['gemini', 'bedrock']).default('gemini'),
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  /** Bedrock model or inference profile id, e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0. Uses AWS_REGION. */
+  BEDROCK_MODEL_ID: z.string().optional(),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

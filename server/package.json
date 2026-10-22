@@ -12,13 +12,16 @@
     "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
     "start": "node --env-file-if-exists=.env dist/src/index.js",
     "seed": "tsx --env-file-if-exists=.env scripts/seed.ts",
+    "samples": "tsx --env-file-if-exists=.env scripts/run-samples.ts",
     "create-table": "tsx --env-file-if-exists=.env scripts/create-table.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1155.0",
     "@aws-sdk/client-dynamodb": "^3.1155.0",
     "@aws-sdk/lib-dynamodb": "^3.1155.0",
     "@fridge-door/shared": "0.1.0",
+    "@google/genai": "^2.30.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "express": "^5.3.0",
     "zod": "^4.6.7"

@@ -79,3 +79,21 @@ export function joinSpoken(parts: string[], conj = 'or', sep = ', '): string {
   if (parts.length === 2 && sep === ', ') return `${parts[0]} ${conj} ${parts[1]}`;
   return `${parts.slice(0, -1).join(sep)}${sep}${conj} ${parts[parts.length - 1]}`;
 }
+
+/** Words that say what kind of thing it is but not which one. */
+const GENERIC = new Set(['bill', 'payment', 'appointment', 'appt', 'delivery', 'package', 'order', 'booking', 'renewal', 'deadline', 'due', 'reminder']);
+
+/**
+ * True when two titles plausibly name the same thing ("Electricity bill" and
+ * "PG&E electricity bill", "Dentist appointment" and "Maya dentist"), but not
+ * two different things of the same kind ("Water bill" and "Electricity bill").
+ */
+export function similarTitles(a: string, b: string): boolean {
+  const ta = new Set(tokens(a));
+  const tb = new Set(tokens(b));
+  const sa = [...ta].filter((t) => !GENERIC.has(t));
+  const sb = [...tb].filter((t) => !GENERIC.has(t));
+  if (sa.length === 0 || sb.length === 0) return ta.size === tb.size && [...ta].every((t) => tb.has(t));
+  const shared = sa.filter((t) => sb.includes(t)).length;
+  return shared / Math.min(sa.length, sb.length) >= 0.5;
+}

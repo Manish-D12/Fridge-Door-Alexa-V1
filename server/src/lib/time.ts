@@ -5,7 +5,7 @@
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-interface LocalDate {
+export interface LocalDate {
   year: number;
   month: number; // 1-12
   day: number;
@@ -124,4 +124,15 @@ export function spokenWhen(dueIso: string, now: number, timeZone: string): strin
   }
   const date = new Intl.DateTimeFormat('en-US', { timeZone, month: 'long', day: 'numeric' }).format(due);
   return `on ${date}${time}`;
+}
+
+/** The same wall-clock time as `instant`, moved to local date `d`. */
+export function onLocalDate(instant: number, d: LocalDate, timeZone: string): number {
+  const w = wallClock(instant, timeZone);
+  return zonedTimeToInstant(d, timeZone, w.hour, w.minute, w.second, ((instant % 1000) + 1000) % 1000);
+}
+
+/** "2026-10-24" for a LocalDate. */
+export function formatIsoDate(d: LocalDate): string {
+  return `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
 }

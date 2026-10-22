@@ -33,7 +33,10 @@ const shortDate = (ms: number) => fmt(ms, { month: 'short', day: 'numeric', year
 const numericDate = (ms: number) => fmt(ms, { month: '2-digit', day: '2-digit', year: 'numeric' });
 const time = (ms: number) => fmt(ms, { hour: 'numeric', minute: '2-digit' });
 
-type Seed = Omit<Obligation, 'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private'> &
+type Seed = Omit<
+  Obligation,
+  'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private' | 'needsConfirmation' | 'confirmationQuestion'
+> &
   Partial<Pick<Obligation, 'status' | 'doneBy' | 'doneAt' | 'private'>> & { createdDaysAgo: number };
 
 const fieldTripDue = by(2);
@@ -213,6 +216,8 @@ const obligations = seeds.map(({ createdDaysAgo, ...s }) =>
     doneBy: null,
     doneAt: null,
     private: false,
+    needsConfirmation: false,
+    confirmationQuestion: null,
     createdAt: iso(at(-createdDaysAgo, 9)),
     ...s,
   } satisfies Obligation),

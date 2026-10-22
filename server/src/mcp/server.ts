@@ -3,6 +3,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import {
   AddObligationInput,
   AddObligationResult,
+  ConfirmItemInput,
+  ConfirmItemResult,
   GetSourceInput,
   GetSourceResult,
   IngestImageInput,
@@ -26,8 +28,9 @@ export const SERVER_VERSION = '0.1.0';
 
 const INSTRUCTIONS = `fridge-door is the household's shared list of obligations: bills, deliveries (orders), bookings, appointments, deadlines and renewals.
 Every tool result has a "speech" field: a short sentence written to be read aloud. Prefer reading it as-is.
-Never read ids aloud; keep them to pass to later calls (mark_done, who_handled, get_source).
+Never read ids aloud; keep them to pass to later calls (mark_done, who_handled, get_source, confirm_item).
 If a tool reports several matches, ask the person which one they meant rather than guessing.
+When ingest_text or ingest_image returns needsConfirmation items, ask each question and pass the answer to confirm_item.
 Some items are private to the person who added them; they are filtered out automatically when someone else asks.`;
 
 type Handler<I> = (input: I) => Promise<{ speech: string } & Record<string, unknown>>;
@@ -163,8 +166,9 @@ export function createMcpServer(service: ObligationService, ctx: RequestContext,
     {
       title: 'Ingest text',
       description:
-        'Hand over the raw text of an email, WhatsApp message or note so obligations can be extracted from it. ' +
-        'Extraction is not connected yet: this currently acknowledges the text and adds nothing.',
+        'Hand over the raw text of an email, WhatsApp message or note. Bills, deliveries, bookings, appointments, deadlines and renewals with a date are extracted and added; ' +
+        'anything already on the list is skipped. Pass the text unedited. ' +
+        'If the result lists needsConfirmation items, ask the person each question and call confirm_item with their answer.',
       inputSchema: IngestTextInput,
       outputSchema: IngestResult,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -177,13 +181,27 @@ export function createMcpServer(service: ObligationService, ctx: RequestContext,
     {
       title: 'Ingest image',
       description:
-        'Hand over a photo (a school slip, a paper bill, an appointment card) so obligations can be extracted from it. ' +
-        'Extraction is not connected yet: this currently validates and acknowledges the image and adds nothing.',
+        'Hand over a photo (a school slip, a paper bill, an appointment card). Its text is transcribed, then obligations with a date are extracted and added, ' +
+        'the same way as ingest_text. If the result lists needsConfirmation items, ask each question and call confirm_item.',
       inputSchema: IngestImageInput,
       outputSchema: IngestResult,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     run('ingest_image', (input) => service.ingestImage(ctx, input)),
+  );
+
+  server.registerTool(
+    'confirm_item',
+    {
+      title: 'Confirm item date',
+      description:
+        'Settle the date of an item that ingest_text or ingest_image flagged with needsConfirmation, after asking the person its question ' +
+        '(e.g. "Is the bake sale on October 11 or November 10?"). Pass the item id and the date they chose; this clears the flag.',
+      inputSchema: ConfirmItemInput,
+      outputSchema: ConfirmItemResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    run('confirm_item', (input) => service.confirmItem(ctx, input)),
   );
 
   return server;

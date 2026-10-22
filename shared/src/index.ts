@@ -70,6 +70,10 @@ export const ObligationSchema = z.object({
   doneBy: PersonName.nullable(),
   doneAt: IsoDateTime.nullable(),
   createdAt: IsoDateTime,
+  /** True when the source was ambiguous about the date (e.g. "10/11") and a person should pick one. */
+  needsConfirmation: z.boolean().default(false),
+  /** Spoken question naming every interpretation, e.g. "Is the bake sale on Sunday, October 11 or Tuesday, November 10?" */
+  confirmationQuestion: z.string().min(1).max(500).nullable().default(null),
 });
 export type Obligation = z.infer<typeof ObligationSchema>;
 
@@ -138,6 +142,35 @@ export const IngestTextInput = z.object({
   source: Source.describe('Where the text came from.'),
 });
 export type IngestTextInput = z.infer<typeof IngestTextInput>;
+
+export const ConfirmItemInput = z.object({
+  id: z.string().trim().min(1).describe('The id of the item that needs confirmation (from an ingest result).'),
+  chosenDate: z
+    .union([IsoDateTime, IsoDate])
+    .describe(
+      "The date the person picked. A plain date (2026-11-10) keeps the item's original time of day, or means the end of that day if it had none.",
+    ),
+});
+export type ConfirmItemInput = z.infer<typeof ConfirmItemInput>;
+
+/**
+ * One obligation found by automatic extraction: the add_obligation fields plus
+ * the date-confirmation flags. Produced by the server, never accepted from clients.
+ */
+export const ExtractedObligation = AddObligationInput.pick({
+  type: true,
+  title: true,
+  dueDate: true,
+  amount: true,
+  currency: true,
+  forWhom: true,
+  sourceSnippet: true,
+  confidence: true,
+}).extend({
+  needsConfirmation: z.boolean(),
+  confirmationQuestion: z.string().min(1).max(500).nullable(),
+});
+export type ExtractedObligation = z.infer<typeof ExtractedObligation>;
 
 /** ~7.5 MB of decoded image data. */
 export const MAX_IMAGE_BASE64_LENGTH = 10_000_000;
@@ -212,13 +245,26 @@ export const GetSourceResult = z.object({
 });
 export type GetSourceResult = z.infer<typeof GetSourceResult>;
 
+export const ConfirmItemResult = z.object({
+  speech: Speech,
+  item: ObligationSchema,
+});
+export type ConfirmItemResult = z.infer<typeof ConfirmItemResult>;
+
+export const INGEST_SKIP_REASONS = ['duplicate', 'snippet_not_found', 'invalid'] as const;
+
 export const IngestResult = z.object({
   speech: Speech,
-  status: z.literal('pending_bedrock'),
   kind: z.enum(['text', 'image']),
   source: Source,
-  receivedBytes: z.number().int().nonnegative(),
-  extracted: z.array(ObligationSchema).describe('Obligations extracted so far (empty until Bedrock extraction is wired).'),
+  items: z.array(ObligationSchema).describe('Obligations that were added.'),
+  needsConfirmation: z
+    .array(z.object({ id: z.string(), title: z.string(), question: z.string() }))
+    .describe('Added items whose date is ambiguous. Ask the question, then call confirm_item with the answer.'),
+  skipped: z
+    .array(z.object({ title: z.string().nullable(), reason: z.enum(INGEST_SKIP_REASONS), existingId: z.string().nullable() }))
+    .describe('Candidates not added: already on the list, not quoted verbatim from the source, or malformed.'),
+  transcript: z.string().nullable().describe('For images, the text read from the photo (snippets quote it). Null for text.'),
 });
 export type IngestResult = z.infer<typeof IngestResult>;
 

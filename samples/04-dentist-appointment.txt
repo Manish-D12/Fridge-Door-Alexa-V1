@@ -1,0 +1,18 @@
+From: Bright Smiles Family Dental <reminders@brightsmiles.example.com>
+Subject: Appointment confirmed for Leo
+Date: Mon, 19 Oct 2026 11:20:00 -0700
+
+Hi Priya,
+
+This confirms Leo's appointment:
+
+  Patient:   Leo Sharma
+  Type:      Cleaning and exam
+  Provider:  Dr. Okafor
+  When:      Tuesday, November 3, 2026 at 4:15 PM
+  Where:     2200 J Street, Suite 140, Sacramento
+
+Please arrive 10 minutes early to update your insurance information. If you need to cancel or reschedule, let us know at least 24 hours in advance to avoid a $40 missed-appointment fee.
+
+See you soon!
+Bright Smiles Family Dental

@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Obligation } from '@fridge-door/shared';
+import type { JsonRequest, LlmProvider, TextRequest } from '../src/llm/types.js';
 import { LocalJsonStore } from '../src/store/local.js';
 
 export const TZ = 'America/Los_Angeles';
@@ -26,6 +27,8 @@ export function ob(overrides: Partial<Obligation> & Pick<Obligation, 'id' | 'tit
     doneBy: null,
     doneAt: null,
     createdAt: '2026-10-01T16:00:00.000Z',
+    needsConfirmation: false,
+    confirmationQuestion: null,
     ...overrides,
   };
 }
@@ -50,3 +53,43 @@ export const FIXTURES: Obligation[] = [
   ob({ id: 'insurance', type: 'renewal', title: 'Car insurance renewal', dueDate: '2026-11-15T07:59:59.999Z', amount: 612 }),
   ob({ id: 'water-old', title: 'Water bill', dueDate: '2026-09-22T06:59:59.999Z', amount: 80, status: 'done', doneBy: 'Priya', doneAt: '2026-09-20T18:00:00.000Z' }),
 ];
+
+/** Stands in for Gemini/Bedrock: returns canned JSON and transcripts, and records every request. */
+export class FakeProvider implements LlmProvider {
+  readonly name = 'fake';
+  readonly jsonRequests: JsonRequest[] = [];
+  readonly textRequests: TextRequest[] = [];
+
+  constructor(
+    private readonly items: unknown[] = [],
+    private readonly transcript = '',
+  ) {}
+
+  async generateText(req: TextRequest): Promise<string> {
+    this.textRequests.push(req);
+    return this.transcript;
+  }
+
+  async generateJson(req: JsonRequest): Promise<unknown> {
+    this.jsonRequests.push(req);
+    return { items: this.items };
+  }
+}
+
+/** A model item with every field the response schema requires. */
+export function raw(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: 'bill',
+    title: 'Something',
+    dueDate: '2026-10-30',
+    dueTime: null,
+    amount: null,
+    currency: null,
+    forWhom: null,
+    confidence: 0.9,
+    needsConfirmation: false,
+    alternativeDueDate: null,
+    confirmationQuestion: null,
+    ...overrides,
+  };
+}

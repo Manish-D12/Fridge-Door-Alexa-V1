@@ -15,6 +15,7 @@ structured data for screens such as the Echo Show.
 ```
 /server   MCP server (Streamable HTTP at /mcp) + REST API (/api), Express 5, TypeScript
 /shared   zod schemas shared by server and web (@fridge-door/shared)
+/samples  example emails and messages for trying extraction (npm run samples)
 /web      Echo Show-style simulator (coming later)
 ```
 
@@ -27,6 +28,8 @@ server/src
 ├── http/context.ts     identity headers + bearer auth
 ├── mcp/server.ts       MCP tool registrations (voice-oriented descriptions)
 ├── service/            business logic shared by MCP and REST (+ spoken-title matching)
+├── extract/            document -> obligations: prompt, validation, snippet and date checks
+├── llm/                LLM providers behind one interface: Gemini (default) and Bedrock
 ├── store/              DynamoDB and local JSON implementations of ObligationStore
 └── lib/                time-zone helpers, errors, logger
 ```
@@ -73,6 +76,9 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `HOUSEHOLD_TIMEZONE` | `America/Los_Angeles` | What "today" and "tomorrow" mean |
 | `DEFAULT_CURRENCY` | `USD` | Currency for items that don't specify one |
 | `CORS_ORIGINS` | — | Browser origins allowed to call the API (e.g. the web simulator) |
+| `LLM_PROVIDER` | `gemini` | Extraction model: `gemini` or `bedrock` |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | — / `gemini-2.5-flash` | Gemini settings |
+| `BEDROCK_MODEL_ID` | — | Bedrock Converse model id (e.g. Claude Haiku); uses `AWS_REGION` |
 
 ## MCP
 
@@ -92,8 +98,31 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `mark_done` | `idOrTitle`, `doneBy` | Marks an item handled. Spoken titles like "the water bill" or "Maya's dentist" are accepted |
 | `who_handled` | `idOrTitle` | Who handled the item and when, or that nobody has yet |
 | `get_source` | `id` | The exact original snippet and where it came from |
-| `ingest_text` | `text`, `source` | **Stub**: returns `status: "pending_bedrock"` (Bedrock extraction comes next) |
-| `ingest_image` | `base64`, `mimeType` | **Stub**: checks the image's file signature, then returns `pending_bedrock` |
+| `ingest_text` | `text`, `source` | Extracts dated obligations from an email or message, skips ones already on the list, and adds the rest |
+| `ingest_image` | `base64`, `mimeType` | Checks the file signature, transcribes the photo, then extracts from the transcript like `ingest_text` |
+| `confirm_item` | `id`, `chosenDate` | Settles an item that ingest flagged with `needsConfirmation` (e.g. "10/11") |
+
+### Extraction
+
+`ingest_text` and `ingest_image` send the document to the model named by `LLM_PROVIDER` and ask for
+structured JSON. The document is fenced with a random marker and the system prompt treats it as data,
+never instructions. The model has no tools, so a document can't change or delete anything: the worst
+it can do is propose a bad candidate, and every candidate is re-checked in code:
+
+- **Shape**: validated with zod. Malformed items are dropped.
+- **sourceSnippet** must be found verbatim in the text (or the photo's transcript). Only whitespace and
+  quote/dash style may differ, and what's stored is the document's own text. Otherwise it's dropped.
+- **Amounts** must be a number that appears in the document, or they're cleared.
+- **Ambiguous dates**: a numeric date like `10/11` that reads both ways is flagged
+  `needsConfirmation` with a `confirmationQuestion` naming both dates, even if the model missed it.
+  A weekday that fits only one reading ("Sun 10/11") settles it.
+- **Duplicates**: skipped when an item visible to the caller has the same type, the same local due
+  date and a similar title.
+- Relative dates ("Friday", "next Friday") are resolved against today in `HOUSEHOLD_TIMEZONE`; the
+  prompt includes a two-week calendar. "Next Friday" means the first Friday after today.
+
+The result's `speech` summarises what was added ("I found 2 things: …") and asks any confirmation
+questions. Without a configured provider the server still starts and the ingest tools say so.
 
 When a title matches more than one item, the tool returns an `isError` result that lists the candidates
 ("I found 2 matches… Which one did you mean?"), so the assistant can ask the person which one they meant.
@@ -125,8 +154,9 @@ These endpoints use the same service, validation and identity headers as the MCP
 | POST | `/api/obligations/mark-done` | `{ idOrTitle, doneBy }` |
 | GET | `/api/obligations/who-handled` | `?idOrTitle=rent` |
 | GET | `/api/obligations/:id/source` | |
-| POST | `/api/ingest/text` | `{ text, source }` → `202` |
-| POST | `/api/ingest/image` | `{ base64, mimeType }` → `202` |
+| POST | `/api/obligations/confirm` | `{ id, chosenDate }` |
+| POST | `/api/ingest/text` | `{ text, source }` |
+| POST | `/api/ingest/image` | `{ base64, mimeType }` |
 | GET | `/healthz` | Liveness check (no auth) |
 
 Errors are returned as `{ "error": { "code", "message", "candidates?", "issues?" } }`, using status
@@ -180,6 +210,12 @@ payment (**private to Priya**) · dishwasher warranty expiry · rent (**already 
 Seeded ids are stable (`seed-water-bill`, `seed-credit-card`, …), which makes `get_source` easy to try.
 Use `npm run seed -- --no-reset` to upsert without clearing the household first.
 
+### Sample documents
+
+`npm run samples` runs each file in [`/samples`](samples) through `ingest_text` with the real provider,
+against a temporary copy of the demo household, and reports whether any existing item changed. It
+needs `GEMINI_API_KEY` (or Bedrock settings). Pass names to run a subset: `npm run samples -- 05 06`.
+
 ## Automated tests
 
 ```bash
@@ -190,6 +226,8 @@ The suite uses Node's built-in test runner and covers:
 
 - time-zone and DST handling
 - every service operation, including privacy and title matching
+- extraction with a fake model: snippet checks, dropped and invalid items, duplicates, ambiguous
+  dates, `confirm_item`, and that ingesting never changes existing items
 - an end-to-end run that starts the real Express app and calls every tool through the official SDK
   client over Streamable HTTP, then exercises the REST API
 
@@ -209,8 +247,6 @@ Then register `https://your-domain.example.com/mcp` as the MCP endpoint.
 
 ## Roadmap
 
-- `ingest_text` / `ingest_image`: Amazon Bedrock extraction into `AddObligationInput`, with
-  `sourceSnippet` and `confidence` filled in by the model
 - `/web`: an Echo Show-style simulator built on the REST API and the shared schemas
 
 ## License

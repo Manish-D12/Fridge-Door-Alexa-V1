@@ -4,7 +4,10 @@ import {
   ObligationSchema,
   type AddObligationInput,
   type AddObligationResult,
+  type ConfirmItemInput,
+  type ConfirmItemResult,
   type DueRange,
+  type ExtractedObligation,
   type GetSourceInput,
   type GetSourceResult,
   type IngestImageInput,
@@ -23,17 +26,20 @@ import {
   type WhoHandledInput,
   type WhoHandledResult,
 } from '@fridge-door/shared';
-import { badRequest, notFound } from '../lib/errors.js';
+import type { ExtractionResult, Extractor } from '../extract/extractor.js';
+import { AppError, badRequest, notFound } from '../lib/errors.js';
 import {
   addLocalDays,
   endOfLocalDay,
   localDateOf,
+  localDayDiff,
+  onLocalDate,
   parseIsoDate,
   spokenWhen,
   startOfLocalDay,
 } from '../lib/time.js';
 import type { ObligationStore } from '../store/types.js';
-import { joinSpoken, normalize, resolveObligation } from './match.js';
+import { joinSpoken, normalize, resolveObligation, similarTitles } from './match.js';
 
 /** Who is asking. Derived from the transport (headers), never from tool arguments. */
 export interface RequestContext {
@@ -45,6 +51,8 @@ export interface RequestContext {
 export interface ServiceOptions {
   timeZone: string;
   defaultCurrency: string;
+  /** Powers ingest_text / ingest_image. Without it those tools report that extraction isn't set up. */
+  extractor?: Extractor;
   now?: () => number;
   newId?: () => string;
 }
@@ -97,6 +105,13 @@ const IMAGE_MAGIC: Partial<Record<IngestImageInput['mimeType'], (b: Buffer) => b
   'image/webp': (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP',
   'image/heic': (b) => b.subarray(4, 8).toString('latin1') === 'ftyp',
 };
+
+interface IngestMeta {
+  kind: IngestResult['kind'];
+  source: Source;
+  transcript: string | null;
+  now: number;
+}
 
 export function sameName(a: string | null | undefined, b: string | null | undefined): boolean {
   return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -193,35 +208,7 @@ export class ObligationService {
 
   async add(ctx: RequestContext, input: AddObligationInput): Promise<AddObligationResult> {
     const now = this.now();
-    const addedBy = input.addedBy?.trim() || ctx.userId;
-    const isPrivate = input.private ?? false;
-    if (isPrivate && !addedBy) {
-      throw badRequest('Private items need to know who is adding them. Say who you are, or make it shared.');
-    }
-    const source = input.source ?? 'manual';
-
-    const candidate: Obligation = {
-      id: this.newId(),
-      householdId: ctx.householdId,
-      type: input.type,
-      title: input.title.trim(),
-      dueDate: this.normalizeDueDate(input.dueDate),
-      amount: input.amount ?? null,
-      currency: (input.currency ?? this.opts.defaultCurrency).toUpperCase(),
-      forWhom: input.forWhom?.trim() || null,
-      source,
-      sourceSnippet: input.sourceSnippet,
-      confidence: input.confidence ?? (source === 'manual' ? 1 : 0.5),
-      private: isPrivate,
-      addedBy: addedBy ?? 'household',
-      status: 'pending',
-      doneBy: null,
-      doneAt: null,
-      createdAt: new Date(now).toISOString(),
-    };
-    const item = ObligationSchema.parse(candidate);
-    await this.store.put(item);
-
+    const item = await this.create(ctx, input, now);
     let speech = `Added ${this.describe(item, now)}.`;
     if (item.private) speech += ` Only ${item.addedBy} can see it.`;
     return { speech, item };
@@ -284,36 +271,167 @@ export class ObligationService {
     };
   }
 
-  // TODO(bedrock): send text to a Bedrock model with a structured-output prompt,
-  // validate each candidate with AddObligationInput, and persist via add().
-  async ingestText(_ctx: RequestContext, input: IngestTextInput): Promise<IngestResult> {
-    return {
-      speech: "I've received that text, but automatic extraction isn't connected yet, so nothing was added.",
-      status: 'pending_bedrock',
-      kind: 'text',
-      source: input.source,
-      receivedBytes: Buffer.byteLength(input.text, 'utf8'),
-      extracted: [],
-    };
+  async ingestText(ctx: RequestContext, input: IngestTextInput): Promise<IngestResult> {
+    const extractor = this.requireExtractor();
+    const now = this.now();
+    const extracted = await extractor.extract(input.text, { sourceDescription: SOURCE_PHRASE[input.source], now });
+    return this.saveExtracted(ctx, extracted, { kind: 'text', source: input.source, transcript: null, now });
   }
 
-  // TODO(bedrock): send the image to a Bedrock vision model (same pipeline as ingestText).
-  async ingestImage(_ctx: RequestContext, input: IngestImageInput): Promise<IngestResult> {
+  /** Transcribes the photo first, so every sourceSnippet quotes real text from it. */
+  async ingestImage(ctx: RequestContext, input: IngestImageInput): Promise<IngestResult> {
     const bytes = Buffer.from(input.base64.replace(/\s+/g, ''), 'base64');
     if (bytes.length === 0) throw badRequest('The image is empty.');
     const check = IMAGE_MAGIC[input.mimeType];
     if (check && !check(bytes)) throw badRequest(`That doesn't look like a ${input.mimeType} image.`);
+
+    const extractor = this.requireExtractor();
+    const now = this.now();
+    const transcript = await extractor.transcribe({ bytes, mimeType: input.mimeType });
+    const meta = { kind: 'image' as const, source: 'photo' as const, transcript, now };
+    if (!transcript) {
+      return { ...this.ingestResult([], [], [], meta), speech: "I couldn't read any text in that photo." };
+    }
+    const extracted = await extractor.extract(transcript, { sourceDescription: 'text transcribed from a photo', now });
+    return this.saveExtracted(ctx, extracted, meta);
+  }
+
+  async confirmItem(ctx: RequestContext, input: ConfirmItemInput): Promise<ConfirmItemResult> {
+    const now = this.now();
+    const existing = await this.store.get(ctx.householdId, input.id.trim());
+    if (!existing || !isVisibleTo(existing, ctx)) throw notFound(`I couldn't find an item with id "${input.id}".`);
+
+    const dueDate = IsoDate.safeParse(input.chosenDate).success
+      ? new Date(onLocalDate(Date.parse(existing.dueDate), parseIsoDate(input.chosenDate), this.opts.timeZone)).toISOString()
+      : this.normalizeDueDate(input.chosenDate);
+    const item = ObligationSchema.parse({ ...existing, dueDate, needsConfirmation: false, confirmationQuestion: null });
+    await this.store.put(item);
     return {
-      speech: "I've received that photo, but automatic extraction isn't connected yet, so nothing was added.",
-      status: 'pending_bedrock',
-      kind: 'image',
-      source: 'photo',
-      receivedBytes: bytes.length,
-      extracted: [],
+      speech: `Got it. ${item.title} is ${DUE_VERB[item.type]}${spokenWhen(item.dueDate, now, this.opts.timeZone)}.`,
+      item,
     };
   }
 
   // -------------------------------------------------------------------------
+
+  private requireExtractor(): Extractor {
+    if (!this.opts.extractor) {
+      throw new AppError('internal', "Reading emails and photos isn't set up on this server yet, so nothing was added.");
+    }
+    return this.opts.extractor;
+  }
+
+  private async create(
+    ctx: RequestContext,
+    input: AddObligationInput,
+    now: number,
+    extra: Pick<Obligation, 'needsConfirmation' | 'confirmationQuestion'> = { needsConfirmation: false, confirmationQuestion: null },
+  ): Promise<Obligation> {
+    const addedBy = input.addedBy?.trim() || ctx.userId;
+    const isPrivate = input.private ?? false;
+    if (isPrivate && !addedBy) {
+      throw badRequest('Private items need to know who is adding them. Say who you are, or make it shared.');
+    }
+    const source = input.source ?? 'manual';
+
+    const candidate: Obligation = {
+      id: this.newId(),
+      householdId: ctx.householdId,
+      type: input.type,
+      title: input.title.trim(),
+      dueDate: this.normalizeDueDate(input.dueDate),
+      amount: input.amount ?? null,
+      currency: (input.currency ?? this.opts.defaultCurrency).toUpperCase(),
+      forWhom: input.forWhom?.trim() || null,
+      source,
+      sourceSnippet: input.sourceSnippet,
+      confidence: input.confidence ?? (source === 'manual' ? 1 : 0.5),
+      private: isPrivate,
+      addedBy: addedBy ?? 'household',
+      status: 'pending',
+      doneBy: null,
+      doneAt: null,
+      createdAt: new Date(now).toISOString(),
+      ...extra,
+    };
+    const item = ObligationSchema.parse(candidate);
+    await this.store.put(item);
+    return item;
+  }
+
+  /**
+   * Adds extracted items, skipping any already on the list: same type, same
+   * local due date and a similar title. Only checks what the caller can see,
+   * so a private item never leaks through a "duplicate" message.
+   */
+  private async saveExtracted(
+    ctx: RequestContext,
+    extracted: ExtractionResult,
+    meta: IngestMeta,
+  ): Promise<IngestResult> {
+    const known = await this.visible(ctx);
+    const added: Obligation[] = [];
+    const duplicates: { item: ExtractedObligation; existing: Obligation }[] = [];
+
+    for (const e of extracted.items) {
+      const dueDate = this.normalizeDueDate(e.dueDate);
+      const existing = known.find(
+        (o) =>
+          o.type === e.type &&
+          localDayDiff(Date.parse(o.dueDate), Date.parse(dueDate), this.opts.timeZone) === 0 &&
+          similarTitles(o.title, e.title),
+      );
+      if (existing) {
+        duplicates.push({ item: e, existing });
+        continue;
+      }
+      const { needsConfirmation, confirmationQuestion, ...fields } = e;
+      const item = await this.create(ctx, { ...fields, source: meta.source }, meta.now, { needsConfirmation, confirmationQuestion });
+      added.push(item);
+      known.push(item);
+    }
+
+    const skipped: IngestResult['skipped'] = [
+      ...duplicates.map(({ item, existing }) => ({ title: item.title, reason: 'duplicate' as const, existingId: existing.id })),
+      ...extracted.rejected.map((r) => ({ title: r.title, reason: r.reason, existingId: null })),
+    ];
+    return this.ingestResult(added, duplicates.map((d) => d.existing), skipped, meta);
+  }
+
+  private ingestResult(added: Obligation[], duplicates: Obligation[], skipped: IngestResult['skipped'], meta: IngestMeta): IngestResult {
+    const { now } = meta;
+    const confirm = added.filter((o) => o.needsConfirmation && o.confirmationQuestion);
+    const parts: string[] = [];
+
+    if (added.length > 0) {
+      const spoken = added.slice(0, MAX_SPOKEN_ITEMS).map((o) => this.describe(o, now));
+      if (added.length > MAX_SPOKEN_ITEMS) spoken.push(`${added.length - MAX_SPOKEN_ITEMS} more`);
+      const count = added.length === 1 ? 'one thing' : `${added.length} things`;
+      parts.push(`I found ${count}: ${joinSpoken(spoken, 'and', '; ')}.`);
+    }
+    if (duplicates.length > 0) {
+      const titles = joinSpoken([...new Set(duplicates.map((o) => o.title))], 'and');
+      const verb = duplicates.length === 1 ? 'was' : 'were';
+      parts.push(added.length > 0 ? `${titles} ${verb} already on the list.` : `I found ${titles}, but ${duplicates.length === 1 ? 'it was' : 'they were'} already on the list.`);
+    }
+    if (parts.length === 0) {
+      parts.push(`I didn't find anything with a date to keep track of in ${meta.kind === 'image' ? 'that photo' : 'that'}.`);
+    }
+    if (confirm.length > 0) {
+      parts.push(confirm.length === 1 ? 'One needs checking.' : `${confirm.length} need checking.`);
+      parts.push(...confirm.slice(0, MAX_SPOKEN_ITEMS).map((o) => o.confirmationQuestion!));
+    }
+
+    return {
+      speech: parts.join(' '),
+      kind: meta.kind,
+      source: meta.source,
+      items: added,
+      needsConfirmation: confirm.map((o) => ({ id: o.id, title: o.title, question: o.confirmationQuestion! })),
+      skipped,
+      transcript: meta.transcript,
+    };
+  }
 
   private async visible(ctx: RequestContext): Promise<Obligation[]> {
     return (await this.store.list(ctx.householdId)).filter((o) => isVisibleTo(o, ctx));

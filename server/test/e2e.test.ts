@@ -6,14 +6,20 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { LATEST_PROTOCOL_VERSION, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { createApp } from '../src/http/app.js';
 import { silentLogger } from '../src/lib/logger.js';
+import { Extractor } from '../src/extract/extractor.js';
 import { ObligationService } from '../src/service/obligations.js';
-import { FIXTURES, HOUSEHOLD, NOW, TZ, tempStore } from './helpers.js';
+import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, raw, TZ, tempStore } from './helpers.js';
 
 const API_KEY = 'test-key-0123456789abcdef';
 const { store, cleanup } = await tempStore();
 for (const o of FIXTURES) await store.put(o);
 
-const service = new ObligationService(store, { timeZone: TZ, defaultCurrency: 'USD', now: () => NOW });
+const DENTIST_TEXT = 'Bright Smiles: Leo is booked for a cleaning on 11/12 at 3:00 PM.';
+const provider = new FakeProvider(
+  [raw({ type: 'appointment', title: 'Leo dentist', forWhom: 'Leo', dueDate: '2026-11-12', dueTime: '15:00', sourceSnippet: DENTIST_TEXT })],
+  DENTIST_TEXT,
+);
+const service = new ObligationService(store, { timeZone: TZ, defaultCurrency: 'USD', extractor: new Extractor(provider, TZ), now: () => NOW });
 const app = createApp({
   config: { HOST: '127.0.0.1', ALLOWED_HOSTS: undefined, CORS_ORIGINS: undefined, API_KEY, DEFAULT_HOUSEHOLD_ID: HOUSEHOLD },
   service,
@@ -44,13 +50,13 @@ after(async () => {
 });
 
 describe('MCP over Streamable HTTP', () => {
-  it('negotiates the latest protocol version and lists all 8 tools with output schemas', async () => {
+  it('negotiates the latest protocol version and lists all 9 tools with output schemas', async () => {
     assert.equal(LATEST_PROTOCOL_VERSION, '2025-11-25');
     assert.equal(client.getServerVersion()?.name, 'fridge-door');
     assert.ok(client.getInstructions()?.includes('speech'));
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'add_obligation', 'get_source', 'ingest_image', 'ingest_text', 'mark_done', 'next_up', 'whats_due', 'who_handled',
+      'add_obligation', 'confirm_item', 'get_source', 'ingest_image', 'ingest_text', 'mark_done', 'next_up', 'whats_due', 'who_handled',
     ]);
     for (const t of tools) {
       assert.ok(t.description && t.description.length > 40, `${t.name} needs a description`);
@@ -82,12 +88,17 @@ describe('MCP over Streamable HTTP', () => {
     const source = await client.callTool({ name: 'get_source', arguments: { id: addedId } });
     assert.equal(structured<{ sourceSnippet: string }>(source).sourceSnippet, 'book the pumpkin patch sunday at 11');
 
-    const text = await client.callTool({ name: 'ingest_text', arguments: { text: 'Dentist on Monday', source: 'whatsapp' } });
-    assert.equal(structured<{ status: string }>(text).status, 'pending_bedrock');
+    const text = await client.callTool({ name: 'ingest_text', arguments: { text: DENTIST_TEXT, source: 'whatsapp' } });
+    const ingested = structured<{ items: { id: string }[]; needsConfirmation: { id: string; question: string }[] }>(text);
+    assert.equal(ingested.items.length, 1);
+    assert.equal(ingested.needsConfirmation[0]!.question, 'Is Leo dentist on Thursday, November 12, or Friday, December 11?');
+
+    const confirmed = await client.callTool({ name: 'confirm_item', arguments: { id: ingested.items[0]!.id, chosenDate: '2026-11-12' } });
+    assert.equal(structured<{ item: { needsConfirmation: boolean } }>(confirmed).item.needsConfirmation, false);
 
     const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
     const image = await client.callTool({ name: 'ingest_image', arguments: { base64: png, mimeType: 'image/png' } });
-    assert.equal(structured<{ status: string }>(image).status, 'pending_bedrock');
+    assert.match((image.content as { text: string }[])[0]!.text, /already on the list/);
   });
 
   it('returns tool errors (not protocol errors) for unknown or ambiguous items', async () => {
@@ -158,7 +169,11 @@ describe('REST API', () => {
     assert.equal(((await res.json()) as { source: string }).source, 'manual');
 
     res = await api('/ingest/text', { method: 'POST', body: JSON.stringify({ text: 'hello', source: 'gmail' }) });
-    assert.equal(res.status, 202);
+    assert.equal(res.status, 200);
+    assert.ok(((await res.json()) as { skipped: { reason: string }[] }).skipped.some((x) => x.reason === 'snippet_not_found'));
+
+    res = await api('/obligations/confirm', { method: 'POST', body: JSON.stringify({ id: item.id, chosenDate: '2026-12-01' }) });
+    assert.equal(res.status, 200);
 
     res = await api('/obligations');
     const all = ((await res.json()) as { items: { id: string }[] }).items.map((o) => o.id);

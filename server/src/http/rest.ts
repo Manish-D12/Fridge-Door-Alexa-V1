@@ -2,6 +2,7 @@ import { Router, type Request } from 'express';
 import type { z } from 'zod';
 import {
   AddObligationInput,
+  ConfirmItemInput,
   GetSourceInput,
   IngestImageInput,
   IngestTextInput,
@@ -34,6 +35,7 @@ function parse<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
  *   POST /api/obligations/mark-done          { idOrTitle, doneBy }
  *   GET  /api/obligations/who-handled?idOrTitle=
  *   GET  /api/obligations/:id/source
+ *   POST /api/obligations/confirm            { id, chosenDate }
  *   POST /api/ingest/text                    { text, source }
  *   POST /api/ingest/image                   { base64, mimeType }
  */
@@ -70,12 +72,16 @@ export function createRestRouter(service: ObligationService, defaultHouseholdId:
     res.json(await service.getSource(ctx(req), parse(GetSourceInput, req.params)));
   });
 
+  router.post('/obligations/confirm', async (req, res) => {
+    res.json(await service.confirmItem(ctx(req), parse(ConfirmItemInput, req.body)));
+  });
+
   router.post('/ingest/text', async (req, res) => {
-    res.status(202).json(await service.ingestText(ctx(req), parse(IngestTextInput, req.body)));
+    res.json(await service.ingestText(ctx(req), parse(IngestTextInput, req.body)));
   });
 
   router.post('/ingest/image', async (req, res) => {
-    res.status(202).json(await service.ingestImage(ctx(req), parse(IngestImageInput, req.body)));
+    res.json(await service.ingestImage(ctx(req), parse(IngestImageInput, req.body)));
   });
 
   return router;
