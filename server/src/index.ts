@@ -1,5 +1,6 @@
 import { loadConfig } from './config.js';
 import { createApp } from './http/app.js';
+import { FileExtractionCache } from './extract/cache.js';
 import { Extractor } from './extract/extractor.js';
 import { createLogger } from './lib/logger.js';
 import { createLlmProvider } from './llm/index.js';
@@ -12,7 +13,10 @@ const store = createStore(config);
 
 let extractor: Extractor | undefined;
 try {
-  extractor = new Extractor(createLlmProvider(config), config.HOUSEHOLD_TIMEZONE);
+  const provider = createLlmProvider(config, {
+    onFallback: (info) => logger.warn('model quota exhausted; trying the next model', info),
+  });
+  extractor = new Extractor(provider, config.HOUSEHOLD_TIMEZONE, new FileExtractionCache(config.EXTRACTION_CACHE_DIR));
 } catch (err) {
   logger.warn('extraction disabled; ingest_text and ingest_image will report it', { provider: config.LLM_PROVIDER, reason: (err as Error).message });
 }
@@ -32,6 +36,7 @@ const server = app.listen(config.PORT, config.HOST, () => {
     storage: store.describe(),
     timeZone: config.HOUSEHOLD_TIMEZONE,
     extraction: extractor?.providerName ?? 'disabled',
+    extractionCache: extractor ? config.EXTRACTION_CACHE_DIR : undefined,
     auth: config.API_KEY ? 'bearer' : 'none',
   });
 });

@@ -8,6 +8,7 @@ import {
   ObligationType,
 } from '@fridge-door/shared';
 import type { LlmImage, LlmProvider, JsonSchema } from '../llm/types.js';
+import { cacheKey, type ExtractionCache } from './cache.js';
 import { addLocalDays, formatIsoDate, type LocalDate, localDateOf, parseIsoDate, zonedTimeToInstant } from '../lib/time.js';
 
 /**
@@ -19,6 +20,11 @@ import { addLocalDays, formatIsoDate, type LocalDate, localDateOf, parseIsoDate,
  *   - numeric dates like 10/11 are flagged for confirmation even if the model missed it
  * The provider has no tools, so document text can at worst produce bad
  * candidates, never change existing items.
+ *
+ * With a cache, the model's raw answer is stored by a hash of the document
+ * (or image bytes) and the prompt, so the same input is only sent once; the
+ * checks above still run on every cached answer. Changing a prompt changes
+ * the key, so old answers are not reused after a prompt edit.
  */
 
 /** A runaway response is more likely an attack or a misread than a real document. */
@@ -29,6 +35,8 @@ export type RejectReason = 'snippet_not_found' | 'invalid';
 export interface ExtractionResult {
   items: ExtractedObligation[];
   rejected: { title: string | null; reason: RejectReason }[];
+  /** True if the model's answer came from the cache. */
+  cached: boolean;
 }
 
 export interface ExtractOptions {
@@ -118,6 +126,7 @@ export class Extractor {
   constructor(
     private readonly provider: LlmProvider,
     private readonly timeZone: string,
+    private readonly cache?: ExtractionCache,
   ) {}
 
   get providerName(): string {
@@ -125,25 +134,31 @@ export class Extractor {
   }
 
   async transcribe(image: LlmImage): Promise<string> {
-    const text = await this.provider.generateText({
-      system: TRANSCRIBE_SYSTEM_PROMPT,
-      prompt: 'Transcribe all of the text in this image.',
-      image,
-    });
-    return text.trim();
+    const key = cacheKey('transcribe', TRANSCRIBE_SYSTEM_PROMPT, image.mimeType, image.bytes);
+    const { value } = await this.cached(key, () =>
+      this.provider.generateText({
+        system: TRANSCRIBE_SYSTEM_PROMPT,
+        prompt: 'Transcribe all of the text in this image.',
+        image,
+      }),
+    );
+    return typeof value === 'string' ? value.trim() : '';
   }
 
   async extract(document: string, opts: ExtractOptions): Promise<ExtractionResult> {
     const today = localDateOf(opts.now, this.timeZone);
-    const raw = await this.provider.generateJson({
-      system: EXTRACTION_SYSTEM_PROMPT,
-      prompt: this.prompt(document, today, opts.sourceDescription),
-      name: 'report_obligations',
-      schema: RESPONSE_SCHEMA,
-    });
+    const key = cacheKey('extract', EXTRACTION_SYSTEM_PROMPT, JSON.stringify(RESPONSE_SCHEMA), document);
+    const { value: raw, cached } = await this.cached(key, () =>
+      this.provider.generateJson({
+        system: EXTRACTION_SYSTEM_PROMPT,
+        prompt: this.prompt(document, today, opts.sourceDescription),
+        name: 'report_obligations',
+        schema: RESPONSE_SCHEMA,
+      }),
+    );
 
     const candidates = Array.isArray((raw as { items?: unknown })?.items) ? (raw as { items: unknown[] }).items : [];
-    const result: ExtractionResult = { items: [], rejected: [] };
+    const result: ExtractionResult = { items: [], rejected: [], cached };
     for (const candidate of candidates.slice(0, MAX_ITEMS)) {
       const parsed = RawItem.safeParse(blankToNull(candidate));
       if (!parsed.success) {
@@ -160,6 +175,14 @@ export class Extractor {
       else result.rejected.push({ title: parsed.data.title, reason: 'invalid' });
     }
     return result;
+  }
+
+  private async cached(key: string, call: () => Promise<unknown>): Promise<{ value: unknown; cached: boolean }> {
+    const hit = await this.cache?.get(key);
+    if (hit !== undefined) return { value: hit, cached: true };
+    const value = await call();
+    await this.cache?.set(key, value);
+    return { value, cached: false };
   }
 
   private prompt(document: string, today: LocalDate, sourceDescription: string): string {
@@ -180,15 +203,12 @@ export class Extractor {
 
   /** Converts a validated model item into an ExtractedObligation, applying the code-side checks. */
   private finish(raw: RawItem, snippet: string, document: string): unknown {
-    let needsConfirmation = raw.needsConfirmation ?? false;
-    let alternative = needsConfirmation && raw.alternativeDueDate && raw.alternativeDueDate !== raw.dueDate ? raw.alternativeDueDate : null;
-    if (!alternative) {
-      const found = ambiguousAlternative(snippet, raw.dueDate);
-      if (found) {
-        needsConfirmation = true;
-        alternative = found;
-      }
-    }
+    // A numeric date's other reading is worked out here; the model's guess is
+    // only used when code can't tell (it has answered "11/12" with November 2).
+    const derived = ambiguousAlternative(snippet, raw.dueDate);
+    const needsConfirmation = (raw.needsConfirmation ?? false) || derived !== null;
+    const alternative =
+      derived ?? (needsConfirmation && raw.alternativeDueDate && raw.alternativeDueDate !== raw.dueDate ? raw.alternativeDueDate : null);
     let confirmationQuestion: string | null = null;
     if (needsConfirmation) {
       confirmationQuestion = alternative

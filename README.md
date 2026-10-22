@@ -77,7 +77,9 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `DEFAULT_CURRENCY` | `USD` | Currency for items that don't specify one |
 | `CORS_ORIGINS` | — | Browser origins allowed to call the API (e.g. the web simulator) |
 | `LLM_PROVIDER` | `gemini` | Extraction model: `gemini` or `bedrock` |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | — / `gemini-2.5-flash` | Gemini settings |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | — / `gemini-2.5-flash-lite` | Gemini settings |
+| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-2.0-flash` | Tried in order, once each, when a model returns 429 / quota exhausted |
+| `EXTRACTION_CACHE_DIR` | `server/.data/extraction-cache` | Model answers cached by content hash; delete it to clear |
 | `BEDROCK_MODEL_ID` | — | Bedrock Converse model id (e.g. Claude Haiku); uses `AWS_REGION` |
 
 ## MCP
@@ -120,6 +122,14 @@ it can do is propose a bad candidate, and every candidate is re-checked in code:
   date and a similar title.
 - Relative dates ("Friday", "next Friday") are resolved against today in `HOUSEHOLD_TIMEZONE`; the
   prompt includes a two-week calendar. "Next Friday" means the first Friday after today.
+
+**Quota and caching.** If Gemini answers 429 / `RESOURCE_EXHAUSTED`, the call is retried once on each
+model in `GEMINI_FALLBACK_MODELS` in turn (the primary `GEMINI_MODEL` is never repeated); any other
+error fails straight away. The model's raw answer is cached in `EXTRACTION_CACHE_DIR`, keyed by a
+SHA-256 of the document text (or the photo's bytes) and the prompt, so the same document never calls
+the model twice. All the checks above still run on cached answers, and editing the prompt changes the
+key. Relative dates in a cached answer stay resolved against the day it was first read. A cache that
+can't be written (e.g. a read-only disk) just means no caching.
 
 The result's `speech` summarises what was added ("I found 2 things: …") and asks any confirmation
 questions. Without a configured provider the server still starts and the ingest tools say so.
@@ -215,6 +225,8 @@ Use `npm run seed -- --no-reset` to upsert without clearing the household first.
 `npm run samples` runs each file in [`/samples`](samples) through `ingest_text` with the real provider,
 against a temporary copy of the demo household, and reports whether any existing item changed. It
 needs `GEMINI_API_KEY` (or Bedrock settings). Pass names to run a subset: `npm run samples -- 05 06`.
+It shares the server's extraction cache, so re-running a sample costs no quota and prints
+`model calls: 0 (answer from cache)`; add `--fresh` to ask the model again.
 
 ## Automated tests
 
@@ -228,6 +240,7 @@ The suite uses Node's built-in test runner and covers:
 - every service operation, including privacy and title matching
 - extraction with a fake model: snippet checks, dropped and invalid items, duplicates, ambiguous
   dates, `confirm_item`, and that ingesting never changes existing items
+- the extraction cache (memory and on disk) and Gemini model fallback on quota errors
 - an end-to-end run that starts the real Express app and calls every tool through the official SDK
   client over Streamable HTTP, then exercises the REST API
 

@@ -31,9 +31,16 @@ const EnvSchema = z.object({
   /** Model used by ingest_text / ingest_image. */
   LLM_PROVIDER: z.enum(['gemini', 'bedrock']).default('gemini'),
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  GEMINI_MODEL: z.string().default('gemini-2.5-flash-lite'),
+  /** Tried in order, once each, when a model answers 429 / quota exhausted. */
+  GEMINI_FALLBACK_MODELS: z
+    .string()
+    .default('gemini-2.5-flash-lite,gemini-2.0-flash')
+    .transform((s) => s.split(',').map((m) => m.trim()).filter(Boolean)),
   /** Bedrock model or inference profile id, e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0. Uses AWS_REGION. */
   BEDROCK_MODEL_ID: z.string().optional(),
+  /** Model answers are cached here by content hash, so the same document is never sent twice. */
+  EXTRACTION_CACHE_DIR: z.string().default(path.join(packageRoot, '.data', 'extraction-cache')),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

@@ -6,6 +6,9 @@
  *
  * After each sample it checks that no pre-existing item changed, then ingests
  * the electricity bill a second time to show duplicate detection.
+ *
+ * Model answers go in the same cache the server uses (EXTRACTION_CACHE_DIR), so
+ * re-running a sample costs no quota. Pass --fresh to ignore cached answers.
  */
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -14,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import type { IngestResult, Obligation, Source } from '@fridge-door/shared';
 import { loadConfig } from '../src/config.js';
+import { FileExtractionCache, MemoryExtractionCache } from '../src/extract/cache.js';
 import { Extractor } from '../src/extract/extractor.js';
 import { createLlmProvider, type LlmProvider } from '../src/llm/index.js';
 import { ObligationService, type RequestContext } from '../src/service/obligations.js';
@@ -22,7 +26,9 @@ const samplesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 
 let provider: LlmProvider;
 try {
-  provider = createLlmProvider(loadConfig());
+  provider = createLlmProvider(loadConfig(), {
+    onFallback: ({ from, to, reason }) => console.log(`  (${from}: ${reason}; falling back to ${to})`),
+  });
 } catch (err) {
   console.error(`Can't run samples: ${(err as Error).message}. Set it in server/.env (see .env.example).`);
   process.exit(1);
@@ -41,17 +47,25 @@ const { createStore } = await import('../src/store/index.js');
 const store = createStore(config);
 const tz = config.HOUSEHOLD_TIMEZONE;
 /** Keeps the model's last raw answer, to show what it quoted when a snippet is rejected. */
-let lastRaw: { items?: { title?: string; sourceSnippet?: string }[] } | undefined;
+type RawAnswer = { items?: { title?: string; sourceSnippet?: string }[] };
+let lastRaw: RawAnswer | undefined;
+let modelCalls = 0;
 const recording: LlmProvider = {
   name: provider.name,
-  generateText: (req) => withRetry(() => provider.generateText(req)),
+  generateText: (req) => {
+    modelCalls++;
+    return withRetry(() => provider.generateText(req));
+  },
   generateJson: async (req) => {
+    modelCalls++;
     const out = await withRetry(() => provider.generateJson(req));
-    lastRaw = out as typeof lastRaw;
+    lastRaw = out as RawAnswer;
     return out;
   },
 };
-const extractor = new Extractor(recording, tz);
+const args = process.argv.slice(2);
+const cache = args.includes('--fresh') ? new MemoryExtractionCache() : new FileExtractionCache(config.EXTRACTION_CACHE_DIR);
+const extractor = new Extractor(recording, tz, cache);
 const service = new ObligationService(store, { timeZone: tz, defaultCurrency: config.DEFAULT_CURRENCY, extractor });
 const ctx: RequestContext = { householdId: config.DEFAULT_HOUSEHOLD_ID, userId: 'Priya' };
 
@@ -66,6 +80,8 @@ async function run(file: string): Promise<void> {
   const text = await readFile(path.join(samplesDir, file), 'utf8');
   const source = SOURCES.find(([re]) => re.test(file))![1];
   const before = await store.list(ctx.householdId);
+  const callsBefore = modelCalls;
+  lastRaw = undefined;
 
   let result: IngestResult;
   try {
@@ -79,13 +95,16 @@ async function run(file: string): Promise<void> {
   const after = new Map((await store.list(ctx.householdId)).map((o) => [o.id, o]));
   const changed = before.filter((o) => !isDeepStrictEqual(after.get(o.id), o));
 
+  const calls = modelCalls - callsBefore;
   console.log(`\n=== ${file} (${source}) ===`);
+  console.log(`  model calls: ${calls}${calls === 0 ? ' (answer from cache)' : ''}`);
   console.log(`  speech: ${result.speech}`);
   for (const o of result.items) printItem(o);
   for (const s of result.skipped) {
     console.log(`  - skipped ${JSON.stringify(s.title)}: ${s.reason}${s.existingId ? ` (matches ${s.existingId})` : ''}`);
     if (s.reason === 'snippet_not_found') {
-      const quoted = lastRaw?.items?.find((i) => i.title?.trim() === s.title)?.sourceSnippet;
+      // Cast: TS narrows lastRaw to undefined after the reset above, not seeing the async write.
+      const quoted = (lastRaw as RawAnswer | undefined)?.items?.find((i) => i.title?.trim() === s.title)?.sourceSnippet;
       console.log(`      model quoted: ${JSON.stringify(quoted)}`);
     }
   }
@@ -121,7 +140,7 @@ function printItem(o: Obligation): void {
 
 try {
   console.log(`\nProvider: ${extractor.providerName}. Today in ${tz}: ${local(new Date().toISOString())}`);
-  const filters = process.argv.slice(2);
+  const filters = args.filter((a) => !a.startsWith('--'));
   const files = (await readdir(samplesDir)).filter((f) => f.endsWith('.txt') && (filters.length === 0 || filters.some((x) => f.includes(x)))).sort();
   for (const f of files) await run(f);
 
