@@ -274,7 +274,7 @@ export class ObligationService {
   async ingestText(ctx: RequestContext, input: IngestTextInput): Promise<IngestResult> {
     const extractor = this.requireExtractor();
     const now = this.now();
-    const extracted = await extractor.extract(input.text, { sourceDescription: SOURCE_PHRASE[input.source], now });
+    const extracted = await reading(() => extractor.extract(input.text, { sourceDescription: SOURCE_PHRASE[input.source], now }));
     return this.saveExtracted(ctx, extracted, { kind: 'text', source: input.source, transcript: null, now });
   }
 
@@ -287,12 +287,12 @@ export class ObligationService {
 
     const extractor = this.requireExtractor();
     const now = this.now();
-    const transcript = await extractor.transcribe({ bytes, mimeType: input.mimeType });
+    const transcript = await reading(() => extractor.transcribe({ bytes, mimeType: input.mimeType }));
     const meta = { kind: 'image' as const, source: 'photo' as const, transcript, now };
     if (!transcript) {
       return { ...this.ingestResult([], [], [], meta), speech: "I couldn't read any text in that photo." };
     }
-    const extracted = await extractor.extract(transcript, { sourceDescription: 'text transcribed from a photo', now });
+    const extracted = await reading(() => extractor.extract(transcript, { sourceDescription: 'text transcribed from a photo', now }));
     return this.saveExtracted(ctx, extracted, meta);
   }
 
@@ -459,5 +459,18 @@ export class ObligationService {
     const ms = Date.parse(value);
     if (Number.isNaN(ms)) throw badRequest(`"${value}" is not a valid date.`);
     return new Date(ms).toISOString();
+  }
+}
+
+/** Model failures (quota, overload, network) become a message a person can act on; nothing has been saved yet. */
+async function reading<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    throw Object.assign(
+      new AppError('internal', "I couldn't read that just now. The reading service is busy or has hit its limit, so nothing was added. Please try again later."),
+      { cause: err },
+    );
   }
 }

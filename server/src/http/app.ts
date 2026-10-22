@@ -5,11 +5,13 @@ import {
   localhostHostValidation,
 } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js';
 import type { ApiError } from '@fridge-door/shared';
+import type { Agent } from '../agent/agent.js';
 import type { Config } from '../config.js';
 import { AppError, HTTP_STATUS } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import { createMcpServer, SERVER_NAME, SERVER_VERSION } from '../mcp/server.js';
 import type { ObligationService } from '../service/obligations.js';
+import { createAgentRouter } from './agent.js';
 import { bearerAuth, requestContext } from './context.js';
 import { createRestRouter } from './rest.js';
 
@@ -17,6 +19,8 @@ export interface AppDeps {
   config: Pick<Config, 'HOST' | 'ALLOWED_HOSTS' | 'CORS_ORIGINS' | 'API_KEY' | 'DEFAULT_HOUSEHOLD_ID'>;
   service: ObligationService;
   logger: Logger;
+  /** Powers /agent for the Echo Show simulator; without it those routes say it isn't set up. */
+  agent?: Agent;
 }
 
 const csv = (s: string | undefined) => (s ?? '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -26,7 +30,7 @@ const JSON_BODY_LIMIT = '12mb';
 
 const jsonRpcError = (code: number, message: string) => ({ jsonrpc: '2.0' as const, error: { code, message }, id: null });
 
-export function createApp({ config, service, logger }: AppDeps): Express {
+export function createApp({ config, service, logger, agent }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
 
@@ -42,7 +46,7 @@ export function createApp({ config, service, logger }: AppDeps): Express {
     res.json({ ok: true, name: SERVER_NAME, version: SERVER_VERSION });
   });
 
-  app.use(['/mcp', '/api'], bearerAuth(config.API_KEY), express.json({ limit: JSON_BODY_LIMIT }));
+  app.use(['/mcp', '/api', '/agent'], bearerAuth(config.API_KEY), express.json({ limit: JSON_BODY_LIMIT }));
 
   // --- MCP: Streamable HTTP, stateless (a fresh server + transport per request).
   app.post('/mcp', async (req, res) => {
@@ -71,6 +75,9 @@ export function createApp({ config, service, logger }: AppDeps): Express {
 
   // --- REST for the web app.
   app.use('/api', createRestRouter(service, config.DEFAULT_HOUSEHOLD_ID));
+
+  // --- The simulator's assistant, an MCP client of /mcp above.
+  app.use('/agent', createAgentRouter(agent, config.DEFAULT_HOUSEHOLD_ID));
 
   app.use((_req, res) => {
     res.status(404).json({ error: { code: 'not_found', message: 'No such endpoint.' } } satisfies ApiError);
@@ -121,7 +128,7 @@ function cors(origins: string[]): RequestHandler {
         'Access-Control-Allow-Origin': allowAll ? '*' : origin,
         'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
         'Access-Control-Allow-Headers':
-          'Content-Type, Authorization, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID, X-Household-Id, X-User-Id',
+          'Content-Type, Authorization, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID, X-Household-Id, X-Household-Member, X-User-Id',
         'Access-Control-Expose-Headers': 'Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate',
         'Access-Control-Max-Age': '600',
         Vary: 'Origin',

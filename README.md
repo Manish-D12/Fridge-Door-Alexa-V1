@@ -16,7 +16,7 @@ structured data for screens such as the Echo Show.
 /server   MCP server (Streamable HTTP at /mcp) + REST API (/api), Express 5, TypeScript
 /shared   zod schemas shared by server and web (@fridge-door/shared)
 /samples  example emails and messages for trying extraction (npm run samples)
-/web      Echo Show-style simulator (coming later)
+/web      Echo Show 10 simulator: React + Vite + Tailwind, voice in, cards on screen
 ```
 
 ```
@@ -26,6 +26,8 @@ server/src
 ├── http/app.ts         Express app: /mcp, /api, /healthz, host validation, auth, CORS, errors
 ├── http/rest.ts        REST mirror of the MCP tools
 ├── http/context.ts     identity headers + bearer auth
+├── http/agent.ts       /agent routes for the simulator
+├── agent/agent.ts      the "Alexa+" brain: an MCP client of /mcp driving a tool-calling model
 ├── mcp/server.ts       MCP tool registrations (voice-oriented descriptions)
 ├── service/            business logic shared by MCP and REST (+ spoken-title matching)
 ├── extract/            document -> obligations: prompt, validation, snippet and date checks
@@ -45,8 +47,11 @@ server/src
 npm install
 cp .env.example server/.env        # STORAGE=local is already set in the example
 npm run seed                       # 10 demo items in server/.data/obligations.json
-npm run dev                        # http://127.0.0.1:3000/mcp  (tsx watch)
+npm run dev                        # server on :3000 and the Echo Show simulator on :5173
 ```
+
+`npm run dev` runs both with [concurrently](https://www.npmjs.com/package/concurrently); use
+`npm run dev:server` or `npm run dev:web` for one of them.
 
 For a production build: `npm run build && npm start`.
 
@@ -75,10 +80,11 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `DEFAULT_HOUSEHOLD_ID` | `demo-household` | Used when no `X-Household-Id` header is sent |
 | `HOUSEHOLD_TIMEZONE` | `America/Los_Angeles` | What "today" and "tomorrow" mean |
 | `DEFAULT_CURRENCY` | `USD` | Currency for items that don't specify one |
-| `CORS_ORIGINS` | — | Browser origins allowed to call the API (e.g. the web simulator) |
+| `CORS_ORIGINS` | — | Browser origins allowed to call the API. The simulator needs `http://localhost:5173` (set in `.env.example`) |
+| `AGENT_MCP_URL` | `http://127.0.0.1:PORT/mcp` | Where the simulator's agent connects as an MCP client |
 | `LLM_PROVIDER` | `gemini` | Extraction model: `gemini` or `bedrock` |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | — / `gemini-2.5-flash-lite` | Gemini settings |
-| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-2.0-flash` | Tried in order, once each, when a model returns 429 / quota exhausted |
+| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-2.5-flash` | Tried in order, once each, when a model is out of quota (429), overloaded (503) or retired (404) |
 | `EXTRACTION_CACHE_DIR` | `server/.data/extraction-cache` | Model answers cached by content hash; delete it to clear |
 | `BEDROCK_MODEL_ID` | — | Bedrock Converse model id (e.g. Claude Haiku); uses `AWS_REGION` |
 
@@ -126,9 +132,11 @@ it can do is propose a bad candidate, and every candidate is re-checked in code:
 - Relative dates ("Friday", "next Friday") are resolved against today in `HOUSEHOLD_TIMEZONE`; the
   prompt includes a two-week calendar. "Next Friday" means the first Friday after today.
 
-**Quota and caching.** If Gemini answers 429 / `RESOURCE_EXHAUSTED`, the call is retried once on each
-model in `GEMINI_FALLBACK_MODELS` in turn (the primary `GEMINI_MODEL` is never repeated); any other
-error fails straight away. The model's raw answer is cached in `EXTRACTION_CACHE_DIR`, keyed by a
+**Quota and caching.** If Gemini answers 429 / `RESOURCE_EXHAUSTED` or 503 / `UNAVAILABLE`, the call
+is retried once on each model in `GEMINI_FALLBACK_MODELS` in turn (the primary `GEMINI_MODEL` is never
+repeated). A fallback model that Google has retired (404) is skipped. Any other error fails straight
+away, and each request times out after 45 seconds. On the free tier each model allows about 20
+requests a day, and an agent turn uses two or three. The model's raw answer is cached in `EXTRACTION_CACHE_DIR`, keyed by a
 SHA-256 of the document text (or the photo's bytes) and the prompt, so the same document never calls
 the model twice. All the checks above still run on cached answers, and editing the prompt changes the
 key. Relative dates in a cached answer stay resolved against the day it was first read. A cache that
@@ -146,9 +154,9 @@ Identity comes from **request headers**, never from tool arguments, so a model c
 revealing someone else's private items:
 
 - `X-Household-Id`: the partition to read and write (defaults to `DEFAULT_HOUSEHOLD_ID`)
-- `X-User-Id`: the household member making the request
+- `X-Household-Member`: the household member making the request (`X-User-Id` is still accepted)
 
-A private item is only returned when `X-User-Id` matches its `addedBy` (case-insensitive). To everyone
+A private item is only returned when `X-Household-Member` matches its `addedBy` (case-insensitive). To everyone
 else it behaves exactly like a missing item, including in `get_source`, `mark_done` and `who_handled`.
 In production these headers should be set by the authenticated layer in front of the server (for
 example an API gateway that maps the Alexa account or voice profile), and `API_KEY` or real OAuth
@@ -170,13 +178,15 @@ These endpoints use the same service, validation and identity headers as the MCP
 | POST | `/api/obligations/confirm` | `{ id, chosenDate }` |
 | POST | `/api/ingest/text` | `{ text, source }` |
 | POST | `/api/ingest/image` | `{ base64, mimeType }` |
+| POST | `/agent/chat` | `{ message, sessionId? }` → `{ speech, card, sessionId, toolCalls }` (simulator) |
+| POST | `/agent/action` | `{ tool: "ingest_image" | "confirm_item", arguments, sessionId? }` (simulator buttons) |
 | GET | `/healthz` | Liveness check (no auth) |
 
 Errors are returned as `{ "error": { "code", "message", "candidates?", "issues?" } }`, using status
 `400`, `401`, `404`, `409` (ambiguous) or `500`.
 
 ```bash
-curl -s -H "X-User-Id: Dan" "http://127.0.0.1:3000/api/obligations/due?range=week"
+curl -s -H "X-Household-Member: Dan" "http://127.0.0.1:3000/api/obligations/due?range=week"
 ```
 
 ## Testing with MCP Inspector
@@ -190,7 +200,7 @@ npx @modelcontextprotocol/inspector
 ```
 
 Choose transport **Streamable HTTP** and URL `http://localhost:3000/mcp`, then click Connect. To act
-as a specific person, add the header `X-User-Id: Priya` in the connection settings (add
+as a specific person, add the header `X-Household-Member: Priya` in the connection settings (add
 `Authorization: Bearer …` too if `API_KEY` is set). Open **Tools → List Tools** and run any tool.
 
 **CLI**
@@ -202,7 +212,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport 
   --method tools/call --tool-name whats_due --tool-arg range=week
 
 npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http \
-  --header "X-User-Id: Dan" \
+  --header "X-Household-Member: Dan" \
   --method tools/call --tool-name mark_done --tool-arg "idOrTitle=the water bill" doneBy=Dan
 
 npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http \
@@ -243,9 +253,53 @@ The suite uses Node's built-in test runner and covers:
 - every service operation, including privacy and title matching
 - extraction with a fake model: snippet checks, dropped and invalid items, duplicates, ambiguous
   dates, `confirm_item`, and that ingesting never changes existing items
-- the extraction cache (memory and on disk) and Gemini model fallback on quota errors
+- the extraction cache (memory and on disk) and Gemini model fallback on quota, overload and retired models
+- the simulator agent with a scripted model: it lists and calls tools over real MCP, keeps sessions
+  per speaker, builds cards, and handles photo and date-confirmation buttons
 - an end-to-end run that starts the real Express app and calls every tool through the official SDK
   client over Streamable HTTP, then exercises the REST API
+
+## Echo Show simulator (`/web`)
+
+The demo: an Echo Show 10 screen in the browser, with an "Alexa+" agent that uses fridge-door
+**exactly the way Alexa+ would, as an MCP client**. Each turn, `POST /agent/chat` opens a Streamable
+HTTP connection to this server's own `/mcp` with the official SDK client, calls `tools/list`, hands
+the tools to Gemini (function calling, same provider and fallback chain as extraction), runs whatever
+the model calls through `tools/call`, and returns `{ speech, card }`. The speaker's
+`X-Household-Member` header travels on that MCP connection, so private items and `doneBy` work as
+they would on a real device. The card is built from the last tool result. The chip under each answer
+(`MCP · whats_due → get_source`) shows which tools ran.
+
+### Running the demo
+
+```bash
+npm install
+cp .env.example server/.env       # add GEMINI_API_KEY; CORS_ORIGINS=http://localhost:5173 is already set
+npm run seed
+npm run dev
+```
+
+Open **http://localhost:5173** in Chrome or Edge, which have Web Speech recognition. Then:
+
+| Do | You'll see |
+|---|---|
+| Wait on the idle screen | Clock, date, and a "Coming up" card cycling through the next 3 items |
+| Hold **Space** (or the mic button) and say *"What's due this week?"* | Live transcript, the light bar pulses while listening, sweeps while thinking and glows while speaking; a due list with type icons, dates, amounts and who each item is for |
+| *"I paid the water bill"* | A "Done" card: handled by the current speaker |
+| *"What did the school notice say?"* | The item, with the original text quoted in a "From your photo" box |
+| Camera button → snap or **Upload photo** (try `samples/07-science-fair-notice.jpg`) | "Reading your photo…", then a card of what was added |
+| A document with an ambiguous date, such as `samples/05-ambiguous-date.txt` | A question with one button per date; tapping one confirms it in place |
+| Switch **Mom / Dad / Riya** (top right) | A new conversation as that person; Mom (Priya) sees her private credit card bill, the others don't |
+
+The chips under the device send the example questions without a microphone. The keyboard button
+opens a text box, which is shown automatically in browsers without speech recognition (e.g. Firefox).
+Replies are spoken with `speechSynthesis`; speaking, or pressing Space, interrupts the current reply.
+Escape returns to the clock.
+
+The members are defined in `web/src/members.ts`. Mom and Dad send the names used by the demo data
+(Priya and Dan), so their private items and `doneBy` line up. Set `VITE_API_URL` (default
+`http://127.0.0.1:3000`) or `VITE_API_KEY` in `web/.env` if the server runs elsewhere or has
+`API_KEY` set.
 
 ## Connecting to Alexa+
 
@@ -260,10 +314,6 @@ STORAGE=dynamodb
 ```
 
 Then register `https://your-domain.example.com/mcp` as the MCP endpoint.
-
-## Roadmap
-
-- `/web`: an Echo Show-style simulator built on the REST API and the shared schemas
 
 ## License
 

@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { cacheKey, FileExtractionCache, MemoryExtractionCache } from '../src/extract/cache.js';
 import { ambiguousAlternative, Extractor, locateSnippet } from '../src/extract/extractor.js';
-import { GeminiProvider, isQuotaError, withModelFallback } from '../src/llm/gemini.js';
+import { GeminiProvider, isCapacityError, withModelFallback } from '../src/llm/gemini.js';
 import { FakeProvider, NOW, raw, TZ } from './helpers.js';
 
 describe('locateSnippet', () => {
@@ -113,7 +113,7 @@ describe('extraction cache', () => {
 describe('withModelFallback', () => {
   const quota = Object.assign(new Error('{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"retryDelay":"61200s"}]}}'), { status: 429 });
 
-  it('tries the next model once on a quota error', async () => {
+  it('tries the next model once on a quota or overload error', async () => {
     const tried: string[] = [];
     const fallbacks: unknown[] = [];
     const out = await withModelFallback(
@@ -137,10 +137,22 @@ describe('withModelFallback', () => {
     await assert.rejects(withModelFallback(['a', 'b'], async () => { throw quota; }), /RESOURCE_EXHAUSTED/);
   });
 
-  it('recognises quota errors by status or message', () => {
-    assert.equal(isQuotaError(quota), true);
-    assert.equal(isQuotaError(new Error('got status: 429 Too Many Requests')), true);
-    assert.equal(isQuotaError(Object.assign(new Error('nope'), { status: 503 })), false);
+  it('skips a retired fallback model, but not a missing primary', async () => {
+    const gone = Object.assign(new Error('{"error":{"code":404,"status":"NOT_FOUND"}}'), { status: 404 });
+    const out = await withModelFallback(['a', 'b', 'c'], async (m) => {
+      if (m === 'a') throw quota;
+      if (m === 'b') throw gone;
+      return m;
+    });
+    assert.equal(out, 'c');
+    await assert.rejects(withModelFallback(['a', 'b'], async () => { throw gone; }), /NOT_FOUND/);
+  });
+
+  it('recognises quota and overload errors by status or message', () => {
+    assert.equal(isCapacityError(quota), true);
+    assert.equal(isCapacityError(new Error('got status: 429 Too Many Requests')), true);
+    assert.equal(isCapacityError(Object.assign(new Error('{"error":{"code":503,"status":"UNAVAILABLE"}}'), { status: 503 })), true);
+    assert.equal(isCapacityError(Object.assign(new Error('bad request'), { status: 400 })), false);
   });
 
   it('puts the primary model first without repeating it', () => {
@@ -153,7 +165,7 @@ describe('config', () => {
   it('defaults to flash-lite with a fallback list', () => {
     const c = loadConfig({});
     assert.equal(c.GEMINI_MODEL, 'gemini-2.5-flash-lite');
-    assert.deepEqual(c.GEMINI_FALLBACK_MODELS, ['gemini-2.5-flash-lite', 'gemini-2.0-flash']);
+    assert.deepEqual(c.GEMINI_FALLBACK_MODELS, ['gemini-2.5-flash-lite', 'gemini-2.5-flash']);
     assert.deepEqual(loadConfig({ GEMINI_FALLBACK_MODELS: ' x, ,y ' }).GEMINI_FALLBACK_MODELS, ['x', 'y']);
   });
 });

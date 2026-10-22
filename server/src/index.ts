@@ -1,3 +1,4 @@
+import { Agent } from './agent/agent.js';
 import { loadConfig } from './config.js';
 import { createApp } from './http/app.js';
 import { FileExtractionCache } from './extract/cache.js';
@@ -12,13 +13,21 @@ const logger = createLogger(config.LOG_LEVEL);
 const store = createStore(config);
 
 let extractor: Extractor | undefined;
+let agent: Agent | undefined;
 try {
   const provider = createLlmProvider(config, {
     onFallback: (info) => logger.warn('model quota exhausted; trying the next model', info),
   });
   extractor = new Extractor(provider, config.HOUSEHOLD_TIMEZONE, new FileExtractionCache(config.EXTRACTION_CACHE_DIR));
+  agent = new Agent({
+    provider,
+    mcpUrl: config.AGENT_MCP_URL ?? `http://127.0.0.1:${config.PORT}/mcp`,
+    apiKey: config.API_KEY,
+    timeZone: config.HOUSEHOLD_TIMEZONE,
+    logger,
+  });
 } catch (err) {
-  logger.warn('extraction disabled; ingest_text and ingest_image will report it', { provider: config.LLM_PROVIDER, reason: (err as Error).message });
+  logger.warn('extraction and the simulator agent are disabled; they will report it', { provider: config.LLM_PROVIDER, reason: (err as Error).message });
 }
 
 const service = new ObligationService(store, {
@@ -27,7 +36,7 @@ const service = new ObligationService(store, {
   extractor,
 });
 
-const app = createApp({ config, service, logger });
+const app = createApp({ config, service, logger, agent });
 
 const server = app.listen(config.PORT, config.HOST, () => {
   logger.info('fridge-door listening', {
@@ -37,6 +46,7 @@ const server = app.listen(config.PORT, config.HOST, () => {
     timeZone: config.HOUSEHOLD_TIMEZONE,
     extraction: extractor?.providerName ?? 'disabled',
     extractionCache: extractor ? config.EXTRACTION_CACHE_DIR : undefined,
+    agent: agent ? `http://${config.HOST}:${config.PORT}/agent` : 'disabled',
     auth: config.API_KEY ? 'bearer' : 'none',
   });
 });

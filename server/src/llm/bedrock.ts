@@ -4,10 +4,15 @@ import {
   type ContentBlock,
   type ConverseCommandInput,
   type ImageFormat,
+  type Message,
   type ToolInputSchema,
+  type ToolUseBlock,
 } from '@aws-sdk/client-bedrock-runtime';
 import { badRequest } from '../lib/errors.js';
-import type { JsonRequest, LlmImage, LlmProvider, TextRequest } from './types.js';
+import type { ChatMessage, ChatRequest, ChatResponse, JsonRequest, LlmImage, LlmProvider, TextRequest } from './types.js';
+
+/** Converse's JSON document type. */
+type Json = NonNullable<ToolUseBlock['input']>;
 
 const IMAGE_FORMATS: Record<string, ImageFormat> = {
   'image/jpeg': 'jpeg',
@@ -60,6 +65,33 @@ export class BedrockProvider implements LlmProvider {
     return toolUse.input;
   }
 
+  async chat(req: ChatRequest): Promise<ChatResponse> {
+    const res = await this.client.send(
+      new ConverseCommand({
+        modelId: this.modelId,
+        system: [{ text: req.system }],
+        messages: req.messages.map(toMessage),
+        toolConfig: req.tools.length
+          ? {
+              tools: req.tools.map((t) => ({
+                toolSpec: { name: t.name, description: t.description, inputSchema: { json: t.parameters } as ToolInputSchema },
+              })),
+            }
+          : undefined,
+        inferenceConfig: { temperature: 0.2, maxTokens: 1024 },
+      }),
+    );
+    const content = res.output?.message?.content ?? [];
+    return {
+      text: content.map((b) => b.text ?? '').join('').trim(),
+      toolCalls: content.flatMap((b) =>
+        b.toolUse?.toolUseId && b.toolUse.name
+          ? [{ id: b.toolUse.toolUseId, name: b.toolUse.name, arguments: (b.toolUse.input ?? {}) as Record<string, unknown> }]
+          : [],
+      ),
+    };
+  }
+
   private input(system: string, prompt: string, image?: LlmImage): ConverseCommandInput {
     const content: ContentBlock[] = [];
     if (image) {
@@ -74,5 +106,32 @@ export class BedrockProvider implements LlmProvider {
       messages: [{ role: 'user', content }],
       inferenceConfig: { temperature: 0, maxTokens: 4096 },
     };
+  }
+}
+
+function toMessage(m: ChatMessage): Message {
+  switch (m.role) {
+    case 'user':
+      return { role: 'user', content: [{ text: m.text }] };
+    case 'assistant':
+      return {
+        role: 'assistant',
+        content: [
+          ...(m.text ? [{ text: m.text }] : []),
+          ...m.toolCalls.map((c) => ({ toolUse: { toolUseId: c.id, name: c.name, input: c.arguments as Json } })),
+        ],
+      };
+    case 'tool':
+      return {
+        role: 'user',
+        content: m.results.map((r) => ({
+          toolResult: {
+            toolUseId: r.callId,
+            // Converse wants a JSON object here, not a bare value.
+            content: [{ json: { result: r.content } as Json }],
+            status: r.isError ? ('error' as const) : ('success' as const),
+          },
+        })),
+      };
   }
 }

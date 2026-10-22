@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { HOUSEHOLD_HEADER, USER_HEADER } from '@fridge-door/shared';
+import { HOUSEHOLD_HEADER, MEMBER_HEADER, USER_HEADER } from '@fridge-door/shared';
 import { AppError, badRequest } from '../lib/errors.js';
 import type { RequestContext } from '../service/obligations.js';
 
@@ -14,8 +14,8 @@ const HOUSEHOLD_ID = /^[A-Za-z0-9._:@-]{1,100}$/;
 export function requestContext(req: Request, defaultHouseholdId: string): RequestContext {
   const household = req.get(HOUSEHOLD_HEADER)?.trim() || defaultHouseholdId;
   if (!HOUSEHOLD_ID.test(household)) throw badRequest(`Invalid ${HOUSEHOLD_HEADER} header.`);
-  const user = req.get(USER_HEADER)?.trim() || null;
-  if (user !== null && user.length > 100) throw badRequest(`Invalid ${USER_HEADER} header.`);
+  const user = req.get(MEMBER_HEADER)?.trim() || req.get(USER_HEADER)?.trim() || null;
+  if (user !== null && user.length > 100) throw badRequest(`Invalid ${MEMBER_HEADER} header.`);
   return { householdId: household, userId: user };
 }
 

@@ -277,6 +277,45 @@ export const ListObligationsResult = z.object({
 export type ListObligationsResult = z.infer<typeof ListObligationsResult>;
 
 // ---------------------------------------------------------------------------
+// Agent (the "Alexa+" simulator brain behind POST /agent/*)
+// ---------------------------------------------------------------------------
+
+export const AgentChatInput = z.object({
+  message: z.string().trim().min(1).max(2000),
+  /** From a previous reply, to continue the conversation. A new one is started if unknown or expired. */
+  sessionId: z.string().max(100).optional(),
+});
+export type AgentChatInput = z.infer<typeof AgentChatInput>;
+
+/** Screen actions that call one MCP tool directly, without the model choosing. */
+export const AgentActionInput = z.discriminatedUnion('tool', [
+  z.object({ tool: z.literal('ingest_image'), arguments: IngestImageInput, sessionId: z.string().max(100).optional() }),
+  z.object({ tool: z.literal('confirm_item'), arguments: ConfirmItemInput, sessionId: z.string().max(100).optional() }),
+]);
+export type AgentActionInput = z.infer<typeof AgentActionInput>;
+
+const Candidate = z.object({ id: z.string(), title: z.string(), dueDate: IsoDateTime });
+
+/** Structured data for the screen, built from the last tool result of a turn. */
+export const AgentCard = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('due'), result: WhatsDueResult }),
+  z.object({ kind: z.literal('item'), heading: z.string(), item: ObligationSchema }),
+  z.object({ kind: z.literal('source'), result: GetSourceResult, item: ObligationSchema.nullable() }),
+  z.object({ kind: z.literal('ingest'), result: IngestResult }),
+  z.object({ kind: z.literal('choices'), heading: z.string(), candidates: z.array(Candidate) }),
+]);
+export type AgentCard = z.infer<typeof AgentCard>;
+
+export const AgentReply = z.object({
+  speech: Speech,
+  card: AgentCard.nullable(),
+  sessionId: z.string(),
+  /** The MCP tools called this turn, in order. */
+  toolCalls: z.array(z.object({ name: z.string(), arguments: z.record(z.string(), z.unknown()), isError: z.boolean() })),
+});
+export type AgentReply = z.infer<typeof AgentReply>;
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -301,4 +340,6 @@ export type ApiError = z.infer<typeof ApiError>;
 /** Header naming the household. Falls back to the server's DEFAULT_HOUSEHOLD_ID. */
 export const HOUSEHOLD_HEADER = 'x-household-id';
 /** Header naming the household member making the request (controls private-item visibility). */
+export const MEMBER_HEADER = 'x-household-member';
+/** Older name for MEMBER_HEADER, still accepted. */
 export const USER_HEADER = 'x-user-id';

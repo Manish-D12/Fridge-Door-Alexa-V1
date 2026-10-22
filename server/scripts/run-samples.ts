@@ -62,6 +62,7 @@ const recording: LlmProvider = {
     lastRaw = out as RawAnswer;
     return out;
   },
+  chat: (req) => provider.chat(req),
 };
 const args = process.argv.slice(2);
 const cache = args.includes('--fresh') ? new MemoryExtractionCache() : new FileExtractionCache(config.EXTRACTION_CACHE_DIR);

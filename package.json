@@ -7,19 +7,25 @@
   "type": "module",
   "workspaces": [
     "shared",
-    "server"
+    "server",
+    "web"
   ],
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
-    "build": "npm run build -w @fridge-door/shared && npm run build -w @fridge-door/server",
-    "typecheck": "npm run build -w @fridge-door/shared && npm run typecheck -w @fridge-door/server",
-    "dev": "npm run build -w @fridge-door/shared && npm run dev -w @fridge-door/server",
+    "build": "npm run build -w @fridge-door/shared && npm run build -w @fridge-door/server && npm run build -w @fridge-door/web",
+    "typecheck": "npm run build -w @fridge-door/shared && npm run typecheck -w @fridge-door/server && npm run typecheck -w @fridge-door/web",
+    "dev": "npm run build -w @fridge-door/shared && concurrently -k -n server,web -c blue,magenta \"npm run dev -w @fridge-door/server\" \"npm run dev -w @fridge-door/web\"",
+    "dev:server": "npm run build -w @fridge-door/shared && npm run dev -w @fridge-door/server",
+    "dev:web": "npm run dev -w @fridge-door/web",
     "start": "npm run start -w @fridge-door/server",
     "seed": "npm run build -w @fridge-door/shared && npm run seed -w @fridge-door/server",
     "samples": "npm run build -w @fridge-door/shared && npm run samples -w @fridge-door/server",
     "create-table": "npm run create-table -w @fridge-door/server",
     "test": "npm run build -w @fridge-door/shared && npm run test -w @fridge-door/server"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
   }
 }

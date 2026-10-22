@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Obligation } from '@fridge-door/shared';
-import type { JsonRequest, LlmProvider, TextRequest } from '../src/llm/types.js';
+import type { ChatRequest, ChatResponse, JsonRequest, LlmProvider, TextRequest } from '../src/llm/types.js';
 import { LocalJsonStore } from '../src/store/local.js';
 
 export const TZ = 'America/Los_Angeles';
@@ -74,6 +74,27 @@ export class FakeProvider implements LlmProvider {
   async generateJson(req: JsonRequest): Promise<unknown> {
     this.jsonRequests.push(req);
     return { items: this.items };
+  }
+
+  async chat(_req: ChatRequest): Promise<ChatResponse> {
+    throw new Error('FakeProvider has no chat script; use ScriptedChat');
+  }
+}
+
+/** Replies to chat() with a fixed script of turns, recording each request. */
+export class ScriptedChat extends FakeProvider {
+  readonly chatRequests: ChatRequest[] = [];
+
+  constructor(private readonly turns: ChatResponse[]) {
+    super();
+  }
+
+  override async chat(req: ChatRequest): Promise<ChatResponse> {
+    // Copy: the agent keeps appending to the same array.
+    this.chatRequests.push({ ...req, messages: [...req.messages] });
+    const next = this.turns.shift();
+    if (!next) throw new Error('ScriptedChat ran out of turns');
+    return next;
   }
 }
 

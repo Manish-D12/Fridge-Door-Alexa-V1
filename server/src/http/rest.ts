@@ -15,7 +15,7 @@ import { badRequest } from '../lib/errors.js';
 import type { ObligationService } from '../service/obligations.js';
 import { requestContext } from './context.js';
 
-function parse<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
+export function parse<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> {
   const result = schema.safeParse(value ?? {});
   if (!result.success) {
     const summary = result.error.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`).join('; ');
