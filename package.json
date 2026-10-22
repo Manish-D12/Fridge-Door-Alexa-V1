@@ -1,0 +1,24 @@
+{
+  "name": "fridge-door",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared household obligations tracker for Amazon Alexa+, exposed as an MCP server.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "npm run build -w @fridge-door/shared && npm run build -w @fridge-door/server",
+    "typecheck": "npm run build -w @fridge-door/shared && npm run typecheck -w @fridge-door/server",
+    "dev": "npm run build -w @fridge-door/shared && npm run dev -w @fridge-door/server",
+    "start": "npm run start -w @fridge-door/server",
+    "seed": "npm run build -w @fridge-door/shared && npm run seed -w @fridge-door/server",
+    "create-table": "npm run create-table -w @fridge-door/server",
+    "test": "npm run build -w @fridge-door/shared && npm run test -w @fridge-door/server"
+  }
+}
