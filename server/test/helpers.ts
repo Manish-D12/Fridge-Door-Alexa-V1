@@ -29,6 +29,7 @@ export function ob(overrides: Partial<Obligation> & Pick<Obligation, 'id' | 'tit
     createdAt: '2026-10-01T16:00:00.000Z',
     needsConfirmation: false,
     confirmationQuestion: null,
+    confirmationOptions: [],
     ...overrides,
   };
 }

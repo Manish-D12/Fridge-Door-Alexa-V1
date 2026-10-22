@@ -159,6 +159,7 @@ export class Extractor {
 
     const candidates = Array.isArray((raw as { items?: unknown })?.items) ? (raw as { items: unknown[] }).items : [];
     const result: ExtractionResult = { items: [], rejected: [], cached };
+    const dates: Dated[] = [];
     for (const candidate of candidates.slice(0, MAX_ITEMS)) {
       const parsed = RawItem.safeParse(blankToNull(candidate));
       if (!parsed.success) {
@@ -170,10 +171,16 @@ export class Extractor {
         result.rejected.push({ title: parsed.data.title, reason: 'snippet_not_found' });
         continue;
       }
-      const item = ExtractedObligation.safeParse(this.finish(parsed.data, snippet, document));
-      if (item.success) result.items.push(item.data);
-      else result.rejected.push({ title: parsed.data.title, reason: 'invalid' });
+      const { fields, alternative } = this.finish(parsed.data, snippet, document);
+      const item = ExtractedObligation.safeParse(fields);
+      if (!item.success) {
+        result.rejected.push({ title: parsed.data.title, reason: 'invalid' });
+        continue;
+      }
+      result.items.push(item.data);
+      dates.push({ item: item.data, date: parsed.data.dueDate, alternative });
     }
+    flagSameDayItems(dates);
     return result;
   }
 
@@ -202,7 +209,7 @@ export class Extractor {
   }
 
   /** Converts a validated model item into an ExtractedObligation, applying the code-side checks. */
-  private finish(raw: RawItem, snippet: string, document: string): unknown {
+  private finish(raw: RawItem, snippet: string, document: string): { fields: unknown; alternative: string | null } {
     // A numeric date's other reading is worked out here; the model's guess is
     // only used when code can't tell (it has answered "11/12" with November 2).
     const derived = ambiguousAlternative(snippet, raw.dueDate);
@@ -217,7 +224,7 @@ export class Extractor {
     }
 
     const amount = raw.amount != null && amountAppears(document, raw.amount) ? raw.amount : null;
-    return {
+    const fields = {
       type: raw.type,
       title: raw.title,
       dueDate: raw.dueTime ? this.instant(raw.dueDate, raw.dueTime) : raw.dueDate,
@@ -228,7 +235,9 @@ export class Extractor {
       confidence: raw.confidence ?? 0.5,
       needsConfirmation,
       confirmationQuestion,
+      confirmationOptions: needsConfirmation ? confirmationOptions(raw.dueDate, alternative) : [],
     };
+    return { fields, alternative };
   }
 
   private instant(date: string, time: string): string {
@@ -238,6 +247,37 @@ export class Extractor {
 }
 
 // ---------------------------------------------------------------------------
+
+/** An extracted item with its local due date (YYYY-MM-DD) and, if ambiguous, the other reading. */
+interface Dated {
+  item: ExtractedObligation;
+  date: string;
+  alternative: string | null;
+}
+
+/**
+ * Items from the same document on the same day as an ambiguous item usually
+ * got their date from it ("drop off goods by 8:30 that morning"), so they are
+ * just as uncertain. Flag them too, offering the same two days.
+ */
+function flagSameDayItems(dates: Dated[]): void {
+  const anchors = dates.filter((d) => d.item.needsConfirmation);
+  for (const d of dates) {
+    if (d.item.needsConfirmation) continue;
+    const anchor = anchors.find((a) => a.date === d.date);
+    if (!anchor) continue;
+    d.item.needsConfirmation = true;
+    d.item.confirmationOptions = confirmationOptions(d.date, anchor.alternative);
+    d.item.confirmationQuestion = anchor.alternative
+      ? `Is ${d.item.title} on ${joinDates(d.date, anchor.alternative)}?`
+      : `What date is ${d.item.title}? I have ${spokenDate(d.date)}, the same day as ${anchor.item.title}, but that date wasn't clear.`;
+  }
+}
+
+/** The dates a person can pick between, earliest first. */
+function confirmationOptions(date: string, alternative: string | null): string[] {
+  return alternative ? [date, alternative].sort() : [date];
+}
 
 /** Models often send "" where they mean null. */
 function blankToNull(value: unknown): unknown {

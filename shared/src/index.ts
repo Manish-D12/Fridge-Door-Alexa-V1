@@ -74,6 +74,8 @@ export const ObligationSchema = z.object({
   needsConfirmation: z.boolean().default(false),
   /** Spoken question naming every interpretation, e.g. "Is the bake sale on Sunday, October 11 or Tuesday, November 10?" */
   confirmationQuestion: z.string().min(1).max(500).nullable().default(null),
+  /** The local dates (YYYY-MM-DD) to offer when needsConfirmation is set, earliest first. */
+  confirmationOptions: z.array(IsoDate).max(4).default([]),
 });
 export type Obligation = z.infer<typeof ObligationSchema>;
 
@@ -169,6 +171,7 @@ export const ExtractedObligation = AddObligationInput.pick({
 }).extend({
   needsConfirmation: z.boolean(),
   confirmationQuestion: z.string().min(1).max(500).nullable(),
+  confirmationOptions: z.array(IsoDate).max(4),
 });
 export type ExtractedObligation = z.infer<typeof ExtractedObligation>;
 
@@ -259,7 +262,7 @@ export const IngestResult = z.object({
   source: Source,
   items: z.array(ObligationSchema).describe('Obligations that were added.'),
   needsConfirmation: z
-    .array(z.object({ id: z.string(), title: z.string(), question: z.string() }))
+    .array(z.object({ id: z.string(), title: z.string(), question: z.string(), options: z.array(IsoDate).describe('Dates to offer, YYYY-MM-DD.') }))
     .describe('Added items whose date is ambiguous. Ask the question, then call confirm_item with the answer.'),
   skipped: z
     .array(z.object({ title: z.string().nullable(), reason: z.enum(INGEST_SKIP_REASONS), existingId: z.string().nullable() }))

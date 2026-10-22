@@ -35,7 +35,7 @@ const time = (ms: number) => fmt(ms, { hour: 'numeric', minute: '2-digit' });
 
 type Seed = Omit<
   Obligation,
-  'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private' | 'needsConfirmation' | 'confirmationQuestion'
+  'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private' | 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions'
 > &
   Partial<Pick<Obligation, 'status' | 'doneBy' | 'doneAt' | 'private'>> & { createdDaysAgo: number };
 
@@ -218,6 +218,7 @@ const obligations = seeds.map(({ createdDaysAgo, ...s }) =>
     private: false,
     needsConfirmation: false,
     confirmationQuestion: null,
+    confirmationOptions: [],
     createdAt: iso(at(-createdDaysAgo, 9)),
     ...s,
   } satisfies Obligation),

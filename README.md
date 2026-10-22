@@ -118,6 +118,9 @@ it can do is propose a bad candidate, and every candidate is re-checked in code:
 - **Ambiguous dates**: a numeric date like `10/11` that reads both ways is flagged
   `needsConfirmation` with a `confirmationQuestion` naming both dates, even if the model missed it.
   A weekday that fits only one reading ("Sun 10/11") settles it.
+  Other items from the same document on that same day ("drop off goods by 8:30 that morning") are
+  flagged too, since their date came from the ambiguous one. Each flagged item lists its
+  `confirmationOptions` (the dates to offer).
 - **Duplicates**: skipped when an item visible to the caller has the same type, the same local due
   date and a similar title.
 - Relative dates ("Friday", "next Friday") are resolved against today in `HOUSEHOLD_TIMEZONE`; the

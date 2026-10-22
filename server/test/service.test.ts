@@ -304,17 +304,40 @@ describe('ingest', () => {
     const item = r.items[0]!;
     assert.equal(item.needsConfirmation, true);
     assert.equal(item.confirmationQuestion, 'Is Bake sale on Sunday, October 11, or Tuesday, November 10?');
-    assert.deepEqual(r.needsConfirmation, [{ id: item.id, title: 'Bake sale', question: item.confirmationQuestion }]);
+    assert.deepEqual(r.needsConfirmation, [
+      { id: item.id, title: 'Bake sale', question: item.confirmationQuestion, options: ['2026-10-11', '2026-11-10'] },
+    ]);
     assert.match(r.speech, /One needs checking\. Is Bake sale on Sunday, October 11, or Tuesday, November 10\?$/);
 
     const c = await svc.confirmItem(priya, { id: item.id, chosenDate: '2026-11-10' });
     assert.equal(c.item.needsConfirmation, false);
     assert.equal(c.item.confirmationQuestion, null);
+    assert.deepEqual(c.item.confirmationOptions, []);
     assert.equal(c.item.dueDate, '2026-11-10T17:00:00.000Z', 'keeps 9 AM local, now in PST');
     assert.equal(c.speech, 'Got it. Bake sale is due on November 10 at 9:00 AM.');
     assert.equal((await store.get(HOUSEHOLD, item.id))!.needsConfirmation, false);
 
     await rejectsWith(svc.confirmItem(dan, { id: 'card', chosenDate: '2026-10-30' }), 'not_found');
+  });
+
+  it('also flags items from the same document on the same day as an ambiguous one', async () => {
+    const text = 'Our class bake sale is on 11/12 in the courtyard. Please drop off baked goods by 8:30 that morning. Book fair is Nov 20.';
+    const r = await withModel(
+      new FakeProvider([
+        raw({ type: 'booking', title: 'Class bake sale', dueDate: '2026-11-12', sourceSnippet: 'Our class bake sale is on 11/12 in the courtyard.' }),
+        raw({ type: 'deadline', title: 'Drop off baked goods', dueDate: '2026-11-12', dueTime: '08:30', sourceSnippet: 'Please drop off baked goods by 8:30 that morning.' }),
+        raw({ type: 'booking', title: 'Book fair', dueDate: '2026-11-20', sourceSnippet: 'Book fair is Nov 20.' }),
+      ]),
+    ).ingestText(priya, { text, source: 'whatsapp' });
+
+    const [sale, dropOff, fair] = r.items;
+    assert.equal(sale!.confirmationQuestion, 'Is Class bake sale on Thursday, November 12, or Friday, December 11?');
+    assert.equal(dropOff!.needsConfirmation, true);
+    assert.equal(dropOff!.confirmationQuestion, 'Is Drop off baked goods on Thursday, November 12, or Friday, December 11?');
+    assert.deepEqual(dropOff!.confirmationOptions, ['2026-11-12', '2026-12-11']);
+    assert.equal(fair!.needsConfirmation, false, 'a different day is left alone');
+    assert.equal(r.needsConfirmation.length, 2);
+    assert.match(r.speech, /2 need checking\./);
   });
 
   it("doesn't flag a numeric date when the weekday settles it", async () => {

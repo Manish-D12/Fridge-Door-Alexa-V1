@@ -304,7 +304,7 @@ export class ObligationService {
     const dueDate = IsoDate.safeParse(input.chosenDate).success
       ? new Date(onLocalDate(Date.parse(existing.dueDate), parseIsoDate(input.chosenDate), this.opts.timeZone)).toISOString()
       : this.normalizeDueDate(input.chosenDate);
-    const item = ObligationSchema.parse({ ...existing, dueDate, needsConfirmation: false, confirmationQuestion: null });
+    const item = ObligationSchema.parse({ ...existing, dueDate, needsConfirmation: false, confirmationQuestion: null, confirmationOptions: [] });
     await this.store.put(item);
     return {
       speech: `Got it. ${item.title} is ${DUE_VERB[item.type]}${spokenWhen(item.dueDate, now, this.opts.timeZone)}.`,
@@ -325,7 +325,11 @@ export class ObligationService {
     ctx: RequestContext,
     input: AddObligationInput,
     now: number,
-    extra: Pick<Obligation, 'needsConfirmation' | 'confirmationQuestion'> = { needsConfirmation: false, confirmationQuestion: null },
+    extra: Pick<Obligation, 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions'> = {
+      needsConfirmation: false,
+      confirmationQuestion: null,
+      confirmationOptions: [],
+    },
   ): Promise<Obligation> {
     const addedBy = input.addedBy?.trim() || ctx.userId;
     const isPrivate = input.private ?? false;
@@ -385,8 +389,8 @@ export class ObligationService {
         duplicates.push({ item: e, existing });
         continue;
       }
-      const { needsConfirmation, confirmationQuestion, ...fields } = e;
-      const item = await this.create(ctx, { ...fields, source: meta.source }, meta.now, { needsConfirmation, confirmationQuestion });
+      const { needsConfirmation, confirmationQuestion, confirmationOptions, ...fields } = e;
+      const item = await this.create(ctx, { ...fields, source: meta.source }, meta.now, { needsConfirmation, confirmationQuestion, confirmationOptions });
       added.push(item);
       known.push(item);
     }
@@ -427,7 +431,7 @@ export class ObligationService {
       kind: meta.kind,
       source: meta.source,
       items: added,
-      needsConfirmation: confirm.map((o) => ({ id: o.id, title: o.title, question: o.confirmationQuestion! })),
+      needsConfirmation: confirm.map((o) => ({ id: o.id, title: o.title, question: o.confirmationQuestion!, options: o.confirmationOptions })),
       skipped,
       transcript: meta.transcript,
     };
