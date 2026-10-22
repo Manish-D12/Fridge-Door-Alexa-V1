@@ -1,0 +1,218 @@
+# fridge-door
+
+A shared household obligations tracker for **Amazon Alexa+** (Echo / Echo Show), exposed as an
+[MCP](https://modelcontextprotocol.io) server. It covers the things that end up stuck to the fridge
+door: bills, deliveries, bookings, appointments, deadlines and renewals. Ask it:
+
+> "Alexa, what's due this week?" · "When's the next delivery?" · "I paid the water bill." ·
+> "Who signed Maya's field trip slip?" · "Where did that come from?"
+
+Every tool result includes a `speech` field, a sentence written to be read aloud, plus typed
+structured data for screens such as the Echo Show.
+
+## Layout
+
+```
+/server   MCP server (Streamable HTTP at /mcp) + REST API (/api), Express 5, TypeScript
+/shared   zod schemas shared by server and web (@fridge-door/shared)
+/web      Echo Show-style simulator (coming later)
+```
+
+```
+server/src
+├── index.ts            entry point
+├── config.ts           env parsing (zod)
+├── http/app.ts         Express app: /mcp, /api, /healthz, host validation, auth, CORS, errors
+├── http/rest.ts        REST mirror of the MCP tools
+├── http/context.ts     identity headers + bearer auth
+├── mcp/server.ts       MCP tool registrations (voice-oriented descriptions)
+├── service/            business logic shared by MCP and REST (+ spoken-title matching)
+├── store/              DynamoDB and local JSON implementations of ObligationStore
+└── lib/                time-zone helpers, errors, logger
+```
+
+## Requirements
+
+- Node.js 20.19+ (developed on Node 24)
+- For DynamoDB: AWS credentials in the standard provider chain (env vars, `~/.aws`, SSO, or an IAM role)
+
+## Quick start (no AWS)
+
+```bash
+npm install
+cp .env.example server/.env        # STORAGE=local is already set in the example
+npm run seed                       # 10 demo items in server/.data/obligations.json
+npm run dev                        # http://127.0.0.1:3000/mcp  (tsx watch)
+```
+
+For a production build: `npm run build && npm start`.
+
+### With DynamoDB
+
+```bash
+# in server/.env: STORAGE=dynamodb, AWS_REGION=..., (optional) AWS_PROFILE=...
+npm run create-table               # creates fridge-door-obligations (PK householdId, SK id, on-demand)
+npm run seed
+npm run dev
+```
+
+For [DynamoDB Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html),
+set `DYNAMODB_ENDPOINT=http://localhost:8000`.
+
+## Configuration
+
+All settings are environment variables, documented in [`.env.example`](.env.example). The main ones:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STORAGE` | `dynamodb` | `local` (JSON file) or `dynamodb` |
+| `PORT` / `HOST` | `3000` / `127.0.0.1` | Listen address |
+| `ALLOWED_HOSTS` | — | Host-header allow-list; set this when `HOST=0.0.0.0` |
+| `API_KEY` | — | If set, `/mcp` and `/api` require `Authorization: Bearer <key>` |
+| `DEFAULT_HOUSEHOLD_ID` | `demo-household` | Used when no `X-Household-Id` header is sent |
+| `HOUSEHOLD_TIMEZONE` | `America/Los_Angeles` | What "today" and "tomorrow" mean |
+| `DEFAULT_CURRENCY` | `USD` | Currency for items that don't specify one |
+| `CORS_ORIGINS` | — | Browser origins allowed to call the API (e.g. the web simulator) |
+
+## MCP
+
+- SDK: `@modelcontextprotocol/sdk` 1.32.1, whose latest protocol version is **2025-11-25**. The server
+  negotiates `2025-11-25` with current clients and still accepts older protocol versions.
+- Transport: **Streamable HTTP** at `POST /mcp`, in stateless mode: each request gets a fresh server
+  and transport, and responses are plain JSON. No legacy SSE endpoint. `GET` and `DELETE` on `/mcp`
+  return 405.
+- Every tool declares an `outputSchema` and returns `structuredContent`. The content has two text
+  blocks: the `speech` sentence, then the JSON.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `whats_due` | `range`: today \| tomorrow \| week \| month, `forWhom?` | Pending items in the window, soonest first, plus anything overdue. `week` = the next 7 days, `month` = the next 30 days |
+| `next_up` | `type?` | The next upcoming appointment, booking or delivery (or the given type) |
+| `add_obligation` | `type`, `title`, `dueDate`, `sourceSnippet`, `amount?`, `currency?`, `forWhom?`, `source?`, `confidence?`, `private?`, `addedBy?` | Adds an item. A date-only `dueDate` means the end of that day in the household's time zone |
+| `mark_done` | `idOrTitle`, `doneBy` | Marks an item handled. Spoken titles like "the water bill" or "Maya's dentist" are accepted |
+| `who_handled` | `idOrTitle` | Who handled the item and when, or that nobody has yet |
+| `get_source` | `id` | The exact original snippet and where it came from |
+| `ingest_text` | `text`, `source` | **Stub**: returns `status: "pending_bedrock"` (Bedrock extraction comes next) |
+| `ingest_image` | `base64`, `mimeType` | **Stub**: checks the image's file signature, then returns `pending_bedrock` |
+
+When a title matches more than one item, the tool returns an `isError` result that lists the candidates
+("I found 2 matches… Which one did you mean?"), so the assistant can ask the person which one they meant.
+
+### Identity and private items
+
+Identity comes from **request headers**, never from tool arguments, so a model can't be talked into
+revealing someone else's private items:
+
+- `X-Household-Id`: the partition to read and write (defaults to `DEFAULT_HOUSEHOLD_ID`)
+- `X-User-Id`: the household member making the request
+
+A private item is only returned when `X-User-Id` matches its `addedBy` (case-insensitive). To everyone
+else it behaves exactly like a missing item, including in `get_source`, `mark_done` and `who_handled`.
+In production these headers should be set by the authenticated layer in front of the server (for
+example an API gateway that maps the Alexa account or voice profile), and `API_KEY` or real OAuth
+should be enabled.
+
+## REST API (for the web app)
+
+These endpoints use the same service, validation and identity headers as the MCP tools.
+
+| Method | Path | Body / query |
+|---|---|---|
+| GET | `/api/obligations` | List every item visible to the caller |
+| GET | `/api/obligations/due` | `?range=week&forWhom=Maya` |
+| GET | `/api/obligations/next` | `?type=order` |
+| POST | `/api/obligations` | `add_obligation` arguments → `201` |
+| POST | `/api/obligations/mark-done` | `{ idOrTitle, doneBy }` |
+| GET | `/api/obligations/who-handled` | `?idOrTitle=rent` |
+| GET | `/api/obligations/:id/source` | |
+| POST | `/api/ingest/text` | `{ text, source }` → `202` |
+| POST | `/api/ingest/image` | `{ base64, mimeType }` → `202` |
+| GET | `/healthz` | Liveness check (no auth) |
+
+Errors are returned as `{ "error": { "code", "message", "candidates?", "issues?" } }`, using status
+`400`, `401`, `404`, `409` (ambiguous) or `500`.
+
+```bash
+curl -s -H "X-User-Id: Dan" "http://127.0.0.1:3000/api/obligations/due?range=week"
+```
+
+## Testing with MCP Inspector
+
+Start the server (`npm run seed && npm run dev`), then use either the UI or the CLI.
+
+**UI**
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+Choose transport **Streamable HTTP** and URL `http://localhost:3000/mcp`, then click Connect. To act
+as a specific person, add the header `X-User-Id: Priya` in the connection settings (add
+`Authorization: Bearer …` too if `API_KEY` is set). Open **Tools → List Tools** and run any tool.
+
+**CLI**
+
+```bash
+npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http --method tools/list
+
+npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http \
+  --method tools/call --tool-name whats_due --tool-arg range=week
+
+npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http \
+  --header "X-User-Id: Dan" \
+  --method tools/call --tool-name mark_done --tool-arg "idOrTitle=the water bill" doneBy=Dan
+
+npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp --transport http \
+  --method tools/call --tool-name get_source --tool-arg id=seed-field-trip-slip
+```
+
+The CLI exits non-zero when a tool returns `isError: true`, for example on a deliberate "not found".
+
+### Demo data
+
+`npm run seed` resets `DEFAULT_HOUSEHOLD_ID` and adds 10 items. Their dates are relative to today, so
+the demo always has something due:
+
+field trip permission slip (photo) · water bill (Gmail) · car insurance renewal · Amazon delivery ·
+dentist appointment (WhatsApp) · family movie booking · parent-teacher conference · credit card
+payment (**private to Priya**) · dishwasher warranty expiry · rent (**already paid by Dan**).
+
+Seeded ids are stable (`seed-water-bill`, `seed-credit-card`, …), which makes `get_source` easy to try.
+Use `npm run seed -- --no-reset` to upsert without clearing the household first.
+
+## Automated tests
+
+```bash
+npm test
+```
+
+The suite uses Node's built-in test runner and covers:
+
+- time-zone and DST handling
+- every service operation, including privacy and title matching
+- an end-to-end run that starts the real Express app and calls every tool through the official SDK
+  client over Streamable HTTP, then exercises the REST API
+
+## Connecting to Alexa+
+
+Alexa+ needs a publicly reachable HTTPS endpoint. Deploy the server (container, App Runner, ECS,
+or behind a tunnel for development) with:
+
+```
+HOST=0.0.0.0
+ALLOWED_HOSTS=your-domain.example.com
+API_KEY=<long random secret>
+STORAGE=dynamodb
+```
+
+Then register `https://your-domain.example.com/mcp` as the MCP endpoint.
+
+## Roadmap
+
+- `ingest_text` / `ingest_image`: Amazon Bedrock extraction into `AddObligationInput`, with
+  `sourceSnippet` and `confidence` filled in by the model
+- `/web`: an Echo Show-style simulator built on the REST API and the shared schemas
+
+## License
+
+[MIT](LICENSE)
