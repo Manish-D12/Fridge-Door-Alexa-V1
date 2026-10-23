@@ -5,13 +5,15 @@ import path from 'node:path';
 export interface GmailStateData {
   account: string | null;
   refreshToken: string | null;
+  /** Scopes Google granted with the token. Missing on tokens stored before replies existed. */
+  scopes: string[] | null;
   connectedAt: string | null;
   lastSyncAt: string | null;
   /** Message id -> when a sync handled it (read or ruled out), so no email reaches the model twice. */
   processed: Record<string, string>;
 }
 
-const EMPTY: GmailStateData = { account: null, refreshToken: null, connectedAt: null, lastSyncAt: null, processed: {} };
+const EMPTY: GmailStateData = { account: null, refreshToken: null, scopes: null, connectedAt: null, lastSyncAt: null, processed: {} };
 
 /** Sync only looks back 14 days, so older ids can go. */
 const PROCESSED_TTL_MS = 30 * 24 * 60 * 60_000;

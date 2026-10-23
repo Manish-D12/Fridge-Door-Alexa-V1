@@ -30,6 +30,9 @@ export function ob(overrides: Partial<Obligation> & Pick<Obligation, 'id' | 'tit
     needsConfirmation: false,
     confirmationQuestion: null,
     confirmationOptions: [],
+    email: null,
+    links: [],
+    actions: [],
     ...overrides,
   };
 }

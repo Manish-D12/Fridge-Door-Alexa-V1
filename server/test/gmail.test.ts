@@ -7,7 +7,21 @@ import type { AddressInfo } from 'node:net';
 import type { gmail_v1 } from 'googleapis';
 import { MemoryExtractionCache } from '../src/extract/cache.js';
 import { Extractor } from '../src/extract/extractor.js';
-import { emailDocument, htmlToText, messageFromGmail, whyNotRelevant, type MailMessage, type Mailbox } from '../src/gmail/mail.js';
+import {
+  actionLinks,
+  baseDomain,
+  buildReply,
+  emailDocument,
+  emailRef,
+  htmlToText,
+  isNoReply,
+  messageFromGmail,
+  parseAddress,
+  replySubject,
+  whyNotRelevant,
+  type MailMessage,
+  type Mailbox,
+} from '../src/gmail/mail.js';
 import { GmailState } from '../src/gmail/state.js';
 import { GmailSync } from '../src/gmail/sync.js';
 import { createApp } from '../src/http/app.js';
@@ -15,14 +29,18 @@ import { AppError } from '../src/lib/errors.js';
 import { silentLogger } from '../src/lib/logger.js';
 import type { JsonRequest } from '../src/llm/types.js';
 import { ObligationService } from '../src/service/obligations.js';
-import { FakeProvider, HOUSEHOLD, NOW, raw, TZ, tempStore } from './helpers.js';
+import { FakeProvider, HOUSEHOLD, NOW, ob, raw, TZ, tempStore } from './helpers.js';
 
 const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
+
+/** A MailMessage with nothing in it; tests fill in what they need. */
+const BLANK: MailMessage = { id: '', threadId: 't', subject: '', from: '', date: '', labels: [], text: '', messageIdHeader: null, references: null, links: [] };
 
 describe('messageFromGmail', () => {
   it('takes the plain-text part, skipping attachments', () => {
     const m = messageFromGmail({
       id: 'm1',
+      threadId: 'thread-1',
       labelIds: ['INBOX', 'CATEGORY_UPDATES'],
       payload: {
         mimeType: 'multipart/mixed',
@@ -30,6 +48,8 @@ describe('messageFromGmail', () => {
           { name: 'Subject', value: 'Your  PG&E bill is ready' },
           { name: 'From', value: 'PG&E <billing@pge.com>' },
           { name: 'Date', value: 'Wed, 21 Oct 2026 08:00:00 -0700' },
+          { name: 'Message-ID', value: '<bill-1@pge.com>' },
+          { name: 'References', value: '<earlier@pge.com>' },
         ],
         parts: [
           {
@@ -45,11 +65,15 @@ describe('messageFromGmail', () => {
     });
     assert.deepEqual(m, {
       id: 'm1',
+      threadId: 'thread-1',
       subject: 'Your PG&E bill is ready',
       from: 'PG&E <billing@pge.com>',
       date: 'Wed, 21 Oct 2026 08:00:00 -0700',
       labels: ['INBOX', 'CATEGORY_UPDATES'],
       text: 'Amount due: $142.17\nDue date: November 3, 2026\n\nThanks',
+      messageIdHeader: '<bill-1@pge.com>',
+      references: '<earlier@pge.com>',
+      links: [],
     });
   });
 
@@ -73,14 +97,14 @@ describe('messageFromGmail', () => {
   });
 
   it('builds the same document every time, so the extraction cache recognises it', () => {
-    const m: MailMessage = { id: 'x', subject: 'S', from: 'F', date: 'D', labels: [], text: 'Body' };
+    const m: MailMessage = { ...BLANK, id: 'x', subject: 'S', from: 'F', date: 'D', text: 'Body' };
     assert.equal(emailDocument(m), 'Subject: S\nFrom: F\nDate: D\n\nBody');
     assert.equal(emailDocument({ ...m }), emailDocument(m));
   });
 });
 
 describe('whyNotRelevant', () => {
-  const mail = (subject: string, text: string, labels: string[] = []): MailMessage => ({ id: 'x', subject, from: 'a@b.c', date: '', labels, text });
+  const mail = (subject: string, text: string, labels: string[] = []): MailMessage => ({ ...BLANK, id: 'x', subject, from: 'a@b.c', labels, text });
 
   it('lets through emails with an obligation word and a date or amount', () => {
     assert.equal(whyNotRelevant(mail('Your bill is ready', 'Amount due: $84.20')), null);
@@ -140,15 +164,33 @@ class FakeMailbox implements Mailbox {
     this.fetched.push(id);
     return this.messages.find((m) => m.id === id)!;
   }
+
+  /** threadId -> senders that replied, and the times asked about. */
+  readonly replies = new Map<string, string[]>();
+  readonly threadChecks: { threadId: string; afterMs: number; own: string }[] = [];
+  readonly sent: { raw: string; threadId: string }[] = [];
+
+  async repliesInThread(threadId: string, afterMs: number, own: string) {
+    this.threadChecks.push({ threadId, afterMs, own });
+    return this.replies.get(threadId) ?? [];
+  }
+
+  async send(raw: string, threadId: string) {
+    this.sent.push({ raw, threadId });
+    return `sent-${this.sent.length}`;
+  }
 }
 
 const email = (id: string, subject: string, text: string, labels: string[] = []): MailMessage => ({
+  ...BLANK,
   id,
+  threadId: `thread-${id}`,
   subject,
-  from: 'sender@example.com',
+  from: 'Sender <sender@example.com>',
   date: 'Wed, 21 Oct 2026 08:00:00 -0700',
   labels,
   text,
+  messageIdHeader: `<${id}@example.com>`,
 });
 
 const WATER = 'Water bill: $84.20 due Nov 2, 2026.';
@@ -274,18 +316,19 @@ describe('GmailSync', async () => {
   it('asks to connect first, and stores the token file with only what it needs', async () => {
     const { sync, state } = await setup(inbox, { connected: false });
     await assert.rejects(sync.sync(ctx), /Gmail isn't connected yet/);
-    assert.deepEqual(await sync.status(), { configured: true, connected: false, account: null, connectedAt: null, lastSyncAt: null });
+    assert.deepEqual(await sync.status(), { configured: true, connected: false, canSend: false, account: null, connectedAt: null, lastSyncAt: null });
 
     const file = (state as unknown as { file: string }).file;
     await state.markProcessed(['a']);
-    assert.deepEqual(Object.keys(JSON.parse(await readFile(file, 'utf8'))).sort(), ['account', 'connectedAt', 'lastSyncAt', 'processed', 'refreshToken']);
+    assert.deepEqual(Object.keys(JSON.parse(await readFile(file, 'utf8'))).sort(), ['account', 'connectedAt', 'lastSyncAt', 'processed', 'refreshToken', 'scopes']);
   });
 
-  it('builds a Google consent URL for gmail.readonly only', async () => {
+  it('builds a Google consent URL for read plus send-only, nothing broader', async () => {
     const { sync } = await setup([]);
     const url = new URL(sync.authUrl('state-123'));
     assert.equal(url.origin, 'https://accounts.google.com');
-    assert.equal(url.searchParams.get('scope'), 'https://www.googleapis.com/auth/gmail.readonly');
+    assert.equal(url.searchParams.get('scope'), 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send');
+    assert.equal(url.searchParams.get('include_granted_scopes'), 'true');
     assert.equal(url.searchParams.get('access_type'), 'offline');
     assert.equal(url.searchParams.get('state'), 'state-123');
     assert.equal(url.searchParams.get('redirect_uri'), 'http://localhost/cb');
@@ -322,7 +365,7 @@ describe('Google OAuth routes', async () => {
     const res = await fetch(`${base}/auth/google`, { redirect: 'manual' });
     assert.equal(res.status, 302);
     const consent = new URL(res.headers.get('location')!);
-    assert.equal(consent.searchParams.get('scope'), 'https://www.googleapis.com/auth/gmail.readonly');
+    assert.equal(consent.searchParams.get('scope'), 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send');
     const state = consent.searchParams.get('state')!;
     assert.match(state, /^[0-9a-f]{32}$/);
 
@@ -343,9 +386,194 @@ describe('Google OAuth routes', async () => {
   it('keeps /api/gmail behind the API key and reports status', async () => {
     assert.equal((await fetch(`${base}/api/gmail/status`)).status, 401);
     const res = await fetch(`${base}/api/gmail/status`, { headers: { Authorization: 'Bearer test-key-0123456789abcdef' } });
-    assert.deepEqual(await res.json(), { configured: true, connected: false, account: null, connectedAt: null, lastSyncAt: null });
+    assert.deepEqual(await res.json(), { configured: true, connected: false, canSend: false, account: null, connectedAt: null, lastSyncAt: null });
     const sync = await fetch(`${base}/api/gmail/sync`, { method: 'POST', headers: { Authorization: 'Bearer test-key-0123456789abcdef' } });
     assert.equal(sync.status, 400);
     assert.match(((await sync.json()) as { error: { message: string } }).error.message, /Connect Gmail/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Follow-up support: senders, links, replies
+// ---------------------------------------------------------------------------
+
+describe('replying to an email', () => {
+  it('finds renewal, payment and account links on the sender’s or a biller’s domain, and nothing else', () => {
+    const html =
+      '<p>Your policy renews soon.</p>' +
+      '<a href="https://www.harborline.com/policy/HL-1/renew?utm=x&amp;y=1">Renew now</a>' +
+      '<a href="https://click.harborline.com/pay">Pay your bill</a>' +
+      '<a href="http://www.harborline.com/account">Manage your account</a>' + // not https
+      '<a href="https://harborline-secure.evil.com/renew">Renew here</a>' + // another domain
+      '<a href="https://www.paypal.com/invoice/p/123">View invoice</a>' + // known biller
+      '<a href="https://www.harborline.com/unsubscribe">Unsubscribe</a>' +
+      '<a href="https://www.harborline.com/privacy">Privacy</a>' +
+      '<a href="https://www.harborline.com/policy/HL-1/renew?utm=x&y=1">Renew</a>' + // same URL again
+      '<a href="https://facebook.com/harborline">Facebook</a>';
+    const m = messageFromGmail({
+      id: 'r1',
+      threadId: 't1',
+      payload: {
+        mimeType: 'multipart/alternative',
+        headers: [{ name: 'From', value: '"Harborline Insurance" <Renewals@Harborline.com>' }],
+        parts: [
+          { mimeType: 'text/plain', body: { data: b64('Renew at https://www.harborline.com/policy/HL-1/renew?utm=x&y=1 before Nov 15. '.repeat(4)) } },
+          { mimeType: 'text/html', body: { data: b64(html) } },
+        ],
+      },
+    });
+    assert.equal(m.links.length, 13, 'every link is collected first: 9 anchors and 4 in the plain text');
+    assert.deepEqual(actionLinks(m), [
+      { url: 'https://www.harborline.com/policy/HL-1/renew?utm=x&y=1', kind: 'renewal', label: 'Renew now' },
+      { url: 'https://click.harborline.com/pay', kind: 'payment', label: 'Pay your bill' },
+      { url: 'https://www.paypal.com/invoice/p/123', kind: 'payment', label: 'View invoice' },
+    ]);
+    assert.deepEqual(emailRef(m), {
+      gmailMessageId: 'r1',
+      threadId: 't1',
+      messageIdHeader: null,
+      references: null,
+      fromAddress: 'renewals@harborline.com',
+      fromName: 'Harborline Insurance',
+      subject: '(no subject)',
+      demo: false,
+    });
+  });
+
+  it('reads sender addresses and spots no-reply ones', () => {
+    assert.deepEqual(parseAddress('Bright Smiles <dr.smile@brightsmiles.com>'), { address: 'dr.smile@brightsmiles.com', name: 'Bright Smiles' });
+    assert.deepEqual(parseAddress('billing@pge.com'), { address: 'billing@pge.com', name: null });
+    assert.equal(parseAddress('Undisclosed recipients'), null);
+    assert.equal(emailRef({ ...BLANK, id: 'x', from: 'nobody' }), null);
+    assert.equal(isNoReply('no-reply@shop.com'), true);
+    assert.equal(isNoReply('donotreply@bank.com'), true);
+    assert.equal(isNoReply('noreply+orders@shop.com'), true);
+    assert.equal(isNoReply('dr.smile@brightsmiles.com'), false);
+    assert.equal(isNoReply('replies@shop.com'), false);
+    assert.equal(baseDomain('mail.billing.pge.com'), 'pge.com');
+    assert.equal(baseDomain('accounts.example.co.uk'), 'example.co.uk');
+  });
+
+  it('builds a threaded plain-text reply, with no way to add headers', () => {
+    assert.equal(replySubject("RE: Re: Fwd: Maya's cleaning"), "Re: Maya's cleaning");
+    const raw = buildReply({
+      to: 'dr.smile@brightsmiles.com',
+      subject: 'Re: Cleaning\r\nBcc: attacker@evil.com',
+      body: 'Hi,\nThursday works. Café at 4?\n\nPriya',
+      threadId: 't1',
+      inReplyTo: '<appt-1@brightsmiles.com>',
+      references: '<first@brightsmiles.com>',
+    });
+    const text = Buffer.from(raw, 'base64url').toString('utf8');
+    const [head, body] = text.split('\r\n\r\n');
+    assert.deepEqual(head!.split('\r\n'), [
+      'To: dr.smile@brightsmiles.com',
+      'Subject: Re: Cleaning Bcc: attacker@evil.com',
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: base64',
+      'In-Reply-To: <appt-1@brightsmiles.com>',
+      'References: <first@brightsmiles.com> <appt-1@brightsmiles.com>',
+    ]);
+    assert.equal(Buffer.from(body!, 'base64').toString('utf8'), 'Hi,\r\nThursday works. Café at 4?\r\n\r\nPriya');
+    assert.throws(() => buildReply({ to: 'a@b.com, c@d.com', subject: 's', body: 'b', threadId: 't', inReplyTo: null, references: null }));
+    assert.match(Buffer.from(buildReply({ to: 'a@b.com', subject: 'Re: Ünïcode', body: 'b', threadId: 't', inReplyTo: null, references: null }), 'base64url').toString(), /Subject: =\?UTF-8\?B\?/);
+  });
+});
+
+describe('GmailSync and follow-ups', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'fridge-door-reply-'));
+  const cleanups: (() => Promise<void>)[] = [];
+  after(async () => {
+    for (const c of cleanups) await c();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const ctx = { householdId: HOUSEHOLD, userId: 'Priya' };
+  const BILL = 'Your Harborline policy renews on Nov 15, 2026. Premium: $612.00.';
+
+  async function setup(scopes: string[] | null) {
+    const { store, cleanup } = await tempStore();
+    cleanups.push(cleanup);
+    const provider = new PerEmailProvider({ [BILL]: [raw({ type: 'renewal', title: 'Car insurance', dueDate: '2026-11-15', amount: 612, sourceSnippet: BILL })] });
+    const service = new ObligationService(store, { timeZone: TZ, defaultCurrency: 'USD', extractor: new Extractor(provider, TZ), now: () => NOW });
+    const state = new GmailState(path.join(dir, `${Math.random().toString(36).slice(2)}.json`), () => NOW);
+    await state.update((s) => Object.assign(s, { account: 'family@example.com', refreshToken: 'refresh-token', scopes }));
+    const insurance: MailMessage = {
+      ...email('ins', 'Your policy is up for renewal', BILL),
+      from: 'Harborline <renewals@harborline.com>',
+      links: [{ url: 'https://www.harborline.com/renew', text: 'Renew online' }],
+    };
+    const mailbox = new FakeMailbox([insurance]);
+    const sync = new GmailSync({
+      oauth: { clientId: 'id', clientSecret: 'secret', redirectUri: 'http://localhost/cb' },
+      state,
+      service,
+      logger: silentLogger,
+      maxEmails: 5,
+      mailbox: () => mailbox,
+      now: () => NOW,
+    });
+    return { sync, service, store, mailbox };
+  }
+
+  it('keeps the sender, thread and links on items read from an email', async () => {
+    const { sync } = await setup(null);
+    const r = await sync.sync(ctx);
+    assert.deepEqual(r.items[0]!.email, {
+      gmailMessageId: 'ins',
+      threadId: 'thread-ins',
+      messageIdHeader: '<ins@example.com>',
+      references: null,
+      fromAddress: 'renewals@harborline.com',
+      fromName: 'Harborline',
+      subject: 'Your policy is up for renewal',
+      demo: false,
+    });
+    assert.deepEqual(r.items[0]!.links, [{ url: 'https://www.harborline.com/renew', kind: 'renewal', label: 'Renew online' }]);
+    assert.deepEqual(r.replies, []);
+  });
+
+  it('says to reconnect when the stored grant predates replies, and sends once it has gmail.send', async () => {
+    const mail = { to: 'renewals@harborline.com', subject: 'Re: x', body: 'Hi', threadId: 'thread-ins', inReplyTo: '<ins@example.com>', references: null };
+    const old = await setup(null);
+    assert.equal((await old.sync.status()).canSend, false);
+    await assert.rejects(old.sync.send(mail), /Reconnect Gmail to enable replies/);
+    assert.equal(old.mailbox.sent.length, 0);
+
+    const fresh = await setup(['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send']);
+    assert.equal((await fresh.sync.status()).canSend, true);
+    assert.deepEqual(await fresh.sync.send(mail), { messageId: 'sent-1' });
+    assert.equal(fresh.mailbox.sent[0]!.threadId, 'thread-ins');
+    assert.match(Buffer.from(fresh.mailbox.sent[0]!.raw, 'base64url').toString(), /^To: renewals@harborline\.com\r\n/);
+  });
+
+  it('notices a reply in the thread of an item waiting on one, without a model call', async () => {
+    const { sync, store, mailbox } = await setup(null);
+    const sentAt = new Date(NOW - 3_600_000).toISOString();
+    await store.put(
+      ob({
+        id: 'dentist',
+        type: 'appointment',
+        title: 'Dentist appointment',
+        dueDate: '2026-10-24T22:30:00.000Z',
+        source: 'gmail',
+        status: 'awaiting_reply',
+        email: { gmailMessageId: 'd1', threadId: 'thread-d', messageIdHeader: null, references: null, fromAddress: 'dr.smile@brightsmiles.com', fromName: 'Bright Smiles', subject: 'Cleaning', demo: false },
+        actions: [{ type: 'email_sent', intent: 'reschedule', at: sentAt, by: 'Priya', summary: 'emailed Bright Smiles to move it', to: 'dr.smile@brightsmiles.com' }],
+      }),
+    );
+    mailbox.replies.set('thread-d', ['Dr. Okafor <dr.smile@brightsmiles.com>']);
+    const r = await sync.sync(ctx);
+    assert.deepEqual(mailbox.threadChecks, [{ threadId: 'thread-d', afterMs: Date.parse(sentAt), own: 'family@example.com' }]);
+    assert.deepEqual(r.replies, [{ id: 'dentist', title: 'Dentist appointment', from: 'Dr. Okafor' }]);
+    assert.match(r.speech, /^Dr\. Okafor replied about Dentist appointment\. I read 1 new email\./);
+    const item = (await store.get(HOUSEHOLD, 'dentist'))!;
+    assert.equal(item.status, 'pending');
+    assert.deepEqual(item.actions.at(-1), { type: 'reply_received', intent: null, at: new Date(NOW).toISOString(), by: 'Dr. Okafor', summary: 'replied', to: null });
+
+    mailbox.replies.clear();
+    const again = await sync.sync(ctx);
+    assert.deepEqual(again.replies, [], 'no longer waiting, so not checked again');
+    assert.equal(mailbox.threadChecks.length, 1);
   });
 });

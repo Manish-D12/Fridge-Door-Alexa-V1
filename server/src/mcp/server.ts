@@ -5,6 +5,10 @@ import {
   AddObligationResult,
   ConfirmItemInput,
   ConfirmItemResult,
+  DiscardDraftInput,
+  DiscardDraftResult,
+  DraftFollowupInput,
+  DraftFollowupResult,
   GetSourceInput,
   GetSourceResult,
   IngestImageInput,
@@ -14,8 +18,14 @@ import {
   MarkDoneResult,
   NextUpInput,
   NextUpResult,
+  SendFollowupInput,
+  SendFollowupResult,
+  StartRenewalInput,
+  StartRenewalResult,
   SyncInboxInput,
   SyncInboxResult,
+  UpdateDraftInput,
+  UpdateDraftResult,
   WhatsDueInput,
   WhatsDueResult,
   WhoHandledInput,
@@ -24,6 +34,7 @@ import {
 import type { GmailSync } from '../gmail/sync.js';
 import { AppError } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
+import type { FollowUps } from '../service/followups.js';
 import type { ObligationService, RequestContext } from '../service/obligations.js';
 
 export const SERVER_NAME = 'fridge-door';
@@ -34,7 +45,8 @@ Every tool result has a "speech" field: a short sentence written to be read alou
 Never read ids aloud; keep them to pass to later calls (mark_done, who_handled, get_source, confirm_item).
 If a tool reports several matches, ask the person which one they meant rather than guessing.
 When ingest_text, ingest_image or sync_inbox returns needsConfirmation items, ask each question and pass the answer to confirm_item.
-Some items are private to the person who added them; they are filtered out automatically when someone else asks.`;
+Some items are private to the person who added them; they are filtered out automatically when someone else asks.
+Follow-ups: draft_followup only writes a draft. Read its summary to the person and show it, then call send_followup only after they clearly say to send it. Never send in the same turn as drafting.`;
 
 type Handler<I> = (input: I) => Promise<{ speech: string } & Record<string, unknown>>;
 
@@ -42,7 +54,13 @@ type Handler<I> = (input: I) => Promise<{ speech: string } & Record<string, unkn
  * Builds an MCP server bound to one request's identity. In stateless
  * Streamable HTTP mode a fresh server is created for every POST /mcp.
  */
-export function createMcpServer(service: ObligationService, ctx: RequestContext, logger: Logger, gmail?: GmailSync): McpServer {
+export function createMcpServer(
+  service: ObligationService,
+  ctx: RequestContext,
+  logger: Logger,
+  gmail?: GmailSync,
+  followups?: FollowUps,
+): McpServer {
   const server = new McpServer(
     { name: SERVER_NAME, title: 'Fridge Door', version: SERVER_VERSION },
     { instructions: INSTRUCTIONS },
@@ -223,6 +241,81 @@ export function createMcpServer(service: ObligationService, ctx: RequestContext,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     run('confirm_item', (input) => service.confirmItem(ctx, input)),
+  );
+
+  const requireFollowups = (): FollowUps => {
+    if (!followups) throw new AppError('internal', "Follow-up emails aren't set up on this server.");
+    return followups;
+  };
+
+  server.registerTool(
+    'draft_followup',
+    {
+      title: 'Draft a follow-up email',
+      description:
+        'Write a short, polite reply to the email an obligation came from, e.g. to reschedule or cancel an appointment, ask for more time on a bill, confirm, or ask a question. ' +
+        'Use for "ask the dentist to move Maya\'s appointment to Thursday", "email them to cancel", "ask the school if we can pay next week". ' +
+        'The reply always goes to the original sender; there is no recipient argument. Nothing is sent: read the summary in speech, the draft is shown on screen, ' +
+        'and only call send_followup after the person says to send it. Items not from an email have no one to write to; the result says so.',
+      inputSchema: DraftFollowupInput,
+      outputSchema: DraftFollowupResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    run('draft_followup', (input) => requireFollowups().draft(ctx, input)),
+  );
+
+  server.registerTool(
+    'send_followup',
+    {
+      title: 'Send a follow-up email',
+      description:
+        'Send a draft from draft_followup as a reply in the original email thread. Only call this after the person has heard or seen the draft and clearly said to send it ("yes, send it"). ' +
+        'confirmedBy is that person, and must be whoever asked for the draft. Drafts expire after 30 minutes and send once. ' +
+        'If they want changes, call draft_followup again with new details instead.',
+      inputSchema: SendFollowupInput,
+      outputSchema: SendFollowupResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    run('send_followup', (input) => requireFollowups().send(ctx, input)),
+  );
+
+  server.registerTool(
+    'discard_draft',
+    {
+      title: 'Discard a draft',
+      description: 'Throw away a draft from draft_followup so it can never be sent. Use when the person says "no", "don\'t send it" or "never mind".',
+      inputSchema: DiscardDraftInput,
+      outputSchema: DiscardDraftResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    run('discard_draft', (input) => requireFollowups().discard(ctx, input)),
+  );
+
+  server.registerTool(
+    'update_draft',
+    {
+      title: 'Edit a draft',
+      description: 'Replace the body of a draft with text the person edited on a screen. For screens with an editor; a voice assistant should call draft_followup again instead.',
+      inputSchema: UpdateDraftInput,
+      outputSchema: UpdateDraftResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    run('update_draft', (input) => requireFollowups().update(ctx, input)),
+  );
+
+  server.registerTool(
+    'start_renewal',
+    {
+      title: 'Start a renewal',
+      description:
+        'Show the renewal (or account or payment) link from the email an item came from, as a QR code to open on a phone, and mark it as renewal in progress. ' +
+        'Use for "renew the car insurance", "where do I renew it?". It does not renew or pay anything itself; the person finishes on the website, then it can be marked done. ' +
+        'If there is no link, the result says so and may offer to draft_followup with intent ask_question.',
+      inputSchema: StartRenewalInput,
+      outputSchema: StartRenewalResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    run('start_renewal', (input) => requireFollowups().startRenewal(ctx, input)),
   );
 
   return server;

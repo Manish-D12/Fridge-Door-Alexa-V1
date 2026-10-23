@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AgentCard, AgentReply, Obligation } from '@fridge-door/shared';
+import type { AgentActionInput, AgentCard, AgentReply, Obligation } from '@fridge-door/shared';
 import { Camera, ChevronDown, CircleAlert, Keyboard, Mic, SendHorizontal, Wifi, X } from 'lucide-react';
 import { api, API_URL } from './api';
 import { Card, type CardActions } from './components/Cards';
@@ -18,7 +18,14 @@ const DISMISS_MS = 25_000;
 /** A press shorter than this is a tap (listen until silence) rather than push-to-talk. */
 const TAP_MS = 300;
 
-const EXAMPLES = ["What's due this week?", 'I paid the water bill', 'What did the school notice say?', "When's the next delivery?", 'Check my email'];
+const EXAMPLES = [
+  "What's due this week?",
+  'I paid the water bill',
+  'What did the school notice say?',
+  'Check my email',
+  "Ask the dentist to move Maya's appointment to Thursday",
+  'Renew the car insurance',
+];
 
 interface Exchange {
   /** What the person said, or null for a photo. */
@@ -50,7 +57,7 @@ export default function App() {
     try {
       const r = await api.comingUp(memberRef.current);
       setTz(r.timeZone);
-      setComingUp({ items: [...r.overdue, ...r.items].filter((o) => o.status === 'pending').slice(0, 3), loaded: true });
+      setComingUp({ items: [...r.overdue, ...r.items].filter((o) => o.status !== 'done').slice(0, 3), loaded: true });
       setOffline(false);
     } catch {
       setOffline(true);
@@ -95,8 +102,7 @@ export default function App() {
       setExchange((e) => ({ heard: e?.heard ?? null, photo: e?.photo ?? null, reply, error: null }));
       setNow(Date.now());
       void refresh();
-      const pending = reply.card?.kind === 'ingest' && reply.card.result.needsConfirmation.length > 0;
-      say(reply.speech, pending);
+      say(reply.speech, waitsForPerson(reply.card));
     },
     [refresh, say],
   );
@@ -172,7 +178,28 @@ export default function App() {
     [refresh, say, fail],
   );
 
-  const actions: CardActions = { confirm: (id, d) => void confirm(id, d), say: (t) => void ask(t) };
+  /** A button on a card: straight to an MCP tool, no model. */
+  const act = useCallback(
+    async (input: AgentActionInput) => {
+      clearDismiss();
+      stopSpeaking();
+      setPhase('thinking');
+      try {
+        present(await api.action(memberRef.current, { ...input, sessionId: session.current }));
+      } catch (err) {
+        fail(err);
+      }
+    },
+    [present, fail],
+  );
+
+  const actions: CardActions = {
+    confirm: (id, d) => void confirm(id, d),
+    say: (t) => void ask(t),
+    send: (draftId, body) => void act({ tool: 'send_followup', arguments: { draftId, confirmedBy: memberRef.current, ...(body === undefined ? {} : { body }) } }),
+    discard: (draftId) => void act({ tool: 'discard_draft', arguments: { draftId } }),
+    markDone: (id) => void act({ tool: 'mark_done', arguments: { idOrTitle: id, doneBy: memberRef.current } }),
+  };
 
   // --- Voice ----------------------------------------------------------------
 
@@ -332,6 +359,12 @@ export default function App() {
 
 // ---------------------------------------------------------------------------
 
+/** Cards that wait for a tap or an answer stay up instead of returning to the clock. */
+function waitsForPerson(card: AgentCard | null): boolean {
+  if (card?.kind === 'ingest') return card.result.needsConfirmation.length > 0;
+  return card?.kind === 'draft' || card?.kind === 'renewal';
+}
+
 /** After confirm_item, update the ingest card in place instead of replacing it. */
 function foldConfirmation(card: AgentCard | null, id: string, confirmed: AgentCard | null): AgentCard | null {
   if (card?.kind !== 'ingest' || confirmed?.kind !== 'item') return null;
@@ -393,7 +426,7 @@ function ResponseView({ phase, interim, exchange, tz, now, actions }: { phase: P
         )}
       </div>
       {card && (
-        <div key={`${reply!.sessionId}-${reply!.speech}`} className="card-in flex h-full max-h-full min-h-0 flex-col justify-center">
+        <div key={`${reply!.sessionId}-${reply!.speech}`} className="card-in flex h-full max-h-full min-h-0 min-w-0 flex-col justify-center">
           <Card card={card} tz={tz} now={now} actions={actions} />
         </div>
       )}

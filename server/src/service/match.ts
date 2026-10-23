@@ -1,4 +1,4 @@
-import type { Obligation, Status } from '@fridge-door/shared';
+import type { Obligation } from '@fridge-door/shared';
 import { ambiguous, notFound } from '../lib/errors.js';
 
 /**
@@ -49,7 +49,8 @@ export function score(query: string, o: Obligation): number {
 export function resolveObligation(
   items: Obligation[],
   idOrTitle: string,
-  prefer: Status,
+  /** On a tie, keep items that are still open, or ones already done. */
+  prefer: 'open' | 'done',
   now: number,
 ): Obligation {
   const trimmed = idOrTitle.trim();
@@ -62,7 +63,7 @@ export function resolveObligation(
   const best = Math.max(...scored.map((x) => x.s));
   let top = scored.filter((x) => x.s === best).map((x) => x.o);
   if (top.length > 1) {
-    const preferred = top.filter((o) => o.status === prefer);
+    const preferred = top.filter((o) => (o.status === 'done') === (prefer === 'done'));
     if (preferred.length > 0) top = preferred;
   }
   if (top.length === 1) return top[0]!;

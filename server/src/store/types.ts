@@ -12,7 +12,8 @@ export interface ObligationStore {
   put(obligation: Obligation): Promise<void>;
   /**
    * Marks an obligation done. Returns the updated record, or null if it does
-   * not exist. Implementations must not overwrite an existing `done` status
+   * not exist. Any open status (pending, awaiting_reply, renewal_in_progress) can
+   * be marked done. Implementations must not overwrite an existing `done` status
    * (first person to finish it wins) and should return the current record instead.
    */
   markDone(householdId: string, id: string, doneBy: string, doneAt: string): Promise<Obligation | null>;

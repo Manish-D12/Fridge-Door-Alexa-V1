@@ -29,6 +29,9 @@ fridge-door is one shared list for the household, used by voice on an Echo Show:
   obligations are extracted and added.
 - **Coordinate.** "I paid the water bill" marks it done and records who did it. "Did anyone pay the
   rent?" says who and when.
+- **Act.** "Ask the dentist to move it to Thursday" drafts a polite reply in the original email
+  thread and shows it on screen. Nothing is sent until the person who asked says "send it".
+  "Renew the car insurance" shows the renewal link from the email as a QR code to finish on a phone.
 - **Trust.** Every item keeps the exact sentence it came from ("What did the notice say?"). Ambiguous
   dates are asked about, not guessed, and private items stay private.
 
@@ -37,7 +40,7 @@ fridge-door is one shared list for the household, used by voice on an Echo Show:
 ```mermaid
 flowchart LR
   subgraph Sources
-    G[Gmail<br/>gmail.readonly]
+    G[Gmail<br/>gmail.readonly + gmail.send]
     P[Photo of a notice]
     W[Email / WhatsApp text]
   end
@@ -52,6 +55,7 @@ flowchart LR
     REST["/api REST"]
     SVC[ObligationService<br/>privacy, matching, speech]
     EX[Extractor<br/>fence → model → verify]
+    FU[FollowUps<br/>draft → yes → send]
     C[(Content-hash cache)]
     DB[(DynamoDB or<br/>local JSON)]
   end
@@ -70,6 +74,9 @@ flowchart LR
   EX --> C
   EX -- "structured JSON, no tools" --> LLM
   G -- sync_inbox --> SVC
+  MCP --> FU
+  FU -- "one call writes the draft" --> LLM
+  FU -- "reply in the same thread,<br/>only after a yes" --> G
   P -- ingest_image --> SVC
   W -- ingest_text --> SVC
 ```
@@ -107,7 +114,12 @@ flowchart LR
 | `ingest_text` | (a forwarded email or message) | Extracts dated obligations, skips duplicates, and adds the rest |
 | `ingest_image` | (camera button) | Transcribes the photo, then extracts from the transcript |
 | `confirm_item` | "The twelfth" | Settles an item whose date was ambiguous |
-| `sync_inbox` | "Check my email" | Reads up to 5 new emails from the connected Gmail into the list |
+| `sync_inbox` | "Check my email" | Reads up to 5 new emails from the connected Gmail into the list, and notices replies to follow-ups |
+| `draft_followup` | "Ask the dentist to move it to Thursday" | Writes a reply to the email the item came from (reschedule, cancel, request extension, confirm, ask a question). Sends nothing |
+| `send_followup` | "Yes, send it" | Sends that exact draft in the original thread, for the person who asked, within 30 minutes |
+| `discard_draft` | "No, don't send it" | Throws the draft away so it can't be sent |
+| `start_renewal` | "Renew the car insurance" | Shows the renewal or account link from the email as a QR code; never renews or pays itself |
+| `update_draft` | (editing on screen) | Saves the person's edit to a draft. Hidden from the model; used by the Send button |
 
 Full arguments are in [MCP reference](#mcp-reference).
 
@@ -131,12 +143,34 @@ and careful with data.
     text.
   - Amounts must appear in the document. Items that fail are dropped, and the drops are reported.
   - "What did the notice say?" always shows real text.
-- **Read-only Gmail.**
-  - OAuth asks only for `gmail.readonly`, and the callback is protected by a one-time `state`.
+- **Gmail: read, plus send-only for approved replies.**
+  - OAuth asks for `gmail.readonly` and `gmail.send`. Send can't read, change or delete anything.
+    The callback is protected by a one-time `state`. A token from before replies existed keeps
+    working read-only, and the screen says "Reconnect Gmail to enable replies".
   - Keyword checks rule out security codes, sign-in alerts and marketing without a model call.
   - At most 5 emails per sync reach the model, and no email reaches it twice: handled ids are stored
     and answers are cached by content hash.
   - The refresh token lives in a gitignored file, never in the repo or the log.
+- **Follow-up actions never act on their own.**
+  - **Fixed recipient.** A reply always goes to the sender of the email the item was read from. No
+    tool takes an address, so neither the person's words, the model, nor text inside an email can
+    send it anywhere else. The drafting model never even sees the address. No-reply senders and items
+    from photos or speech get "I don't know who to write to", plus an offer to add a reminder instead.
+  - **Explicit confirmation.** `draft_followup` only drafts. `send_followup` sends the stored draft
+    unchanged, only for the person who asked for it (checked against the speaker header and
+    `confirmedBy`), only within 30 minutes, and only once. Cancelled drafts can't be sent. Edits on
+    screen are saved first, so what is sent is exactly what was shown.
+  - **Enforced in the agent too.** The simulator refuses `send_followup` in the same turn as the
+    draft, and unless the person's latest words are a clear yes ("send it", "go ahead") with no "but",
+    "wait" or "change". The system prompt says the same.
+  - **Untrusted input stays data.** The original email is fenced in the drafting prompt. Links and
+    addresses the model slips into a draft are removed, and the person reads the draft before it goes.
+  - **No pretending.** `start_renewal` hands over a link and marks the item "renewal in progress";
+    it never says anything was renewed or paid. Links are kept only if they are https, on the sender's
+    domain or a known payment site, and named like renew, pay or manage. The model sees the site,
+    never the URL.
+  - **Honest demo data.** Seeded emails were never in anyone's inbox, so replies to them go to a local
+    demo outbox (`server/.data/outbox/*.eml`), and Alexa says so.
 - **needsConfirmation.**
   - A numeric date that reads two ways ("11/12") is flagged by code even if the model missed it.
     Same-day items that took their date from it are flagged too.
@@ -163,10 +197,10 @@ The extraction pipeline is also published separately as a small MIT library:
 | MCP | `@modelcontextprotocol/sdk` 1.32.1: server **and** client, Streamable HTTP |
 | Server | Express 5, zod 4 (one set of schemas for MCP input/output, REST and the web app) |
 | Models | Google Gemini via `@google/genai` (`gemini-2.5-flash-lite`, falling back to `gemini-2.5-flash`), or Amazon Bedrock Converse (`@aws-sdk/client-bedrock-runtime`) behind the same interface |
-| Email | Gmail API and Google OAuth 2.0 via `googleapis`, read-only |
+| Email | Gmail API and Google OAuth 2.0 via `googleapis`: read, plus send-only for replies a person approved |
 | Storage | Amazon DynamoDB (`@aws-sdk/lib-dynamodb`) or a local JSON file |
-| Simulator | React 19, Vite 8, Tailwind CSS 4, lucide-react, Web Speech API (recognition and `speechSynthesis`) |
-| Tests | Node's built-in test runner, with 87 server tests and 12 library tests. They need no network and no API key |
+| Simulator | React 19, Vite 8, Tailwind CSS 4, lucide-react, `qrcode` for renewal links, Web Speech API (recognition and `speechSynthesis`) |
+| Tests | Node's built-in test runner, with 108 server tests and 12 library tests. They need no network and no API key |
 
 ## Setup and run
 
@@ -230,6 +264,7 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `BEDROCK_MODEL_ID` | — | Bedrock Converse model id (e.g. Claude Haiku); uses `AWS_REGION` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | — | Gmail sync (OAuth client of type Web application) |
 | `GMAIL_SYNC_MAX_EMAILS` | `5` | Emails sent to the model per sync, at most |
+| `DEMO_OUTBOX_DIR` | `server/.data/outbox` | Where replies to seeded (demo) items are saved instead of sent |
 
 ## Layout
 
@@ -252,9 +287,9 @@ server/src
 ├── http/agent.ts       /agent routes for the simulator
 ├── agent/agent.ts      the "Alexa+" brain: an MCP client of /mcp driving a tool-calling model
 ├── mcp/server.ts       MCP tool registrations (voice-oriented descriptions)
-├── service/            business logic shared by MCP and REST (+ spoken-title matching)
+├── service/            business logic shared by MCP and REST (+ spoken-title matching, follow-up actions)
 ├── extract/            document -> obligations: prompt, validation, snippet and date checks, cache
-├── gmail/              Gmail search, keyword pre-filter, sync state, MIME parsing
+├── gmail/              Gmail search, keyword pre-filter, sync state, MIME parsing, replies, demo outbox
 ├── llm/                LLM providers behind one interface: Gemini (default) and Bedrock
 ├── store/              DynamoDB and local JSON implementations of ObligationStore
 └── lib/                time-zone helpers, errors, logger
@@ -281,7 +316,12 @@ server/src
 | `ingest_text` | `text`, `source` | Extracts dated obligations from an email or message, skips ones already on the list, and adds the rest |
 | `ingest_image` | `base64`, `mimeType` | Checks the file signature, transcribes the photo, then extracts from the transcript like `ingest_text` |
 | `confirm_item` | `id`, `chosenDate` | Settles an item that ingest flagged with `needsConfirmation` (e.g. "10/11") |
-| `sync_inbox` | none | Reads up to 5 new emails from the connected Gmail into the list (see "Gmail sync") |
+| `sync_inbox` | none | Reads up to 5 new emails from the connected Gmail into the list, and checks threads waiting on a reply (see "Gmail sync") |
+| `draft_followup` | `idOrTitle`, `intent`: reschedule \| cancel \| request_extension \| confirm \| ask_question, `details?` | Drafts a reply to the item's source email. Returns `draft` (id, to, subject "Re: …", body, expiry) or `draft: null` with a `reason` when there is nobody to write to |
+| `send_followup` | `draftId`, `confirmedBy` | Sends the draft in its thread (In-Reply-To and References set), logs it in the item's `actions`, and sets `awaiting_reply` for reschedule and cancel |
+| `discard_draft` | `draftId` | Cancels a draft |
+| `update_draft` | `draftId`, `body` | Replaces a draft's body with the person's edit (screens only) |
+| `start_renewal` | `idOrTitle` | Returns the stored renewal, account or payment link and sets `renewal_in_progress`; `link: null` when the email had none |
 
 
 ### Extraction
@@ -403,11 +443,12 @@ The CLI exits non-zero when a tool returns `isError: true`, for example on a del
 `npm run seed` resets `DEFAULT_HOUSEHOLD_ID` and adds 10 items. Their dates are relative to today, so
 the demo always has something due:
 
-field trip permission slip (photo) · water bill (Gmail) · car insurance renewal · Amazon delivery ·
-dentist appointment (WhatsApp) · family movie booking · parent-teacher conference · credit card
+field trip permission slip (photo) · water bill (Gmail) · car insurance renewal (Gmail, with a
+renewal link) · Amazon delivery · dentist appointment (Gmail, from Bright Smiles Dental) · family movie booking · parent-teacher conference · credit card
 payment (**private to Priya**) · dishwasher warranty expiry · rent (**already paid by Dan**).
 
-Seeded ids are stable (`seed-water-bill`, `seed-credit-card`, …), which makes `get_source` easy to try.
+The dentist and insurance items carry a sample sender and thread, so follow-up actions can be demoed;
+replies to them go to the demo outbox, not Gmail. Seeded ids are stable (`seed-water-bill`, `seed-credit-card`, …), which makes `get_source` easy to try.
 Use `npm run seed -- --no-reset` to upsert without clearing the household first.
 
 ### Sample documents
@@ -436,7 +477,12 @@ The suite uses Node's built-in test runner and covers:
 - an end-to-end run that starts the real Express app and calls every tool through the official SDK
   client over Streamable HTTP, then exercises the REST API
 - Gmail sync with a fake mailbox: MIME parsing, the keyword pre-filter, the per-sync limit, never
-  sending an email to the model twice, partial failures, and the OAuth routes (state check, read-only scope)
+  sending an email to the model twice, partial failures, and the OAuth routes (state check, scopes)
+- follow-up actions with a fake model and mailer: the recipient can't be changed, sends need the same
+  member within 30 minutes and happen once, edits are sent as shown, cancelled drafts stay unsent,
+  status and history update, renewal links are filtered and never "renewed", replies are noticed,
+  and reply messages are threaded with no way to inject headers
+- the agent's send guard: no send in the drafting turn, and none without a clear yes
 
 ## Echo Show simulator (`/web`)
 
@@ -469,6 +515,9 @@ Open **http://localhost:5173** in Chrome or Edge, which have Web Speech recognit
 | Camera button → snap or **Upload photo** (try `samples/07-science-fair-notice.jpg`) | "Reading your photo…", then a card of what was added |
 | A document with an ambiguous date, such as `samples/05-ambiguous-date.txt` | A question with one button per date; tapping one confirms it in place |
 | *"Check my email"* (after Settings → Connect Gmail) | A card of what was found in up to 5 new emails; see "Gmail sync" below |
+| *"Ask the dentist to move Maya's appointment to Thursday"* | A draft reply card (To, Subject, editable body) with **Send** and **Cancel**. Alexa reads the summary and asks |
+| *"Yes, send it"* (or tap **Send**) | A green "Sent" card. The dentist shows "Waiting for reply" on the list, with the history on its card |
+| *"Renew the car insurance"* | A big QR code of the renewal link, **Open on phone** and **Mark renewed** |
 | Switch **Mom / Dad / Riya** (top right) | A new conversation as that person; Mom (Priya) sees her private credit card bill, the others don't |
 
 The chips under the device send the example questions without a microphone. The keyboard button
@@ -484,7 +533,7 @@ The members are defined in `web/src/members.ts`. Mom and Dad send the names used
 ### Gmail sync
 
 Settings (the gear, top right) → **Connect Gmail** opens `/auth/google` in a new tab. It asks for
-`gmail.readonly` only; the callback (`/auth/google/callback`, protected by a one-time `state`)
+`gmail.readonly` and `gmail.send` (send-only, for follow-up replies); the callback (`/auth/google/callback`, protected by a one-time `state`)
 stores the refresh token in `server/.data/gmail.json`. Then say *"Alexa, check my email"*: the agent
 calls the `sync_inbox` MCP tool, which does this:
 
@@ -505,6 +554,35 @@ after a reset "check my email" finds them again, answered from the cache.
 To use your own client, create an OAuth client of type *Web application*, enable the Gmail API, add
 `http://localhost:3000/auth/google/callback` as a redirect URI and your account as a test user, then
 set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REDIRECT_URI` in `server/.env`.
+
+### Follow-up actions
+
+Obligations become actions, always with a person confirming:
+
+1. **Draft.** *"Ask the dentist to move Maya's appointment to Thursday"* calls `draft_followup`
+   (intent `reschedule`, details "Thursday"). One Gemini call writes a short, polite reply, cached
+   by content hash. The reply goes to the sender of the email the item was read from. The draft card
+   shows To, Subject (`Re: …`) and an editable body.
+2. **Confirm.** Alexa reads the summary and asks. *"Yes, send it"* or the **Send** button calls
+   `send_followup` with the speaker as `confirmedBy`. Edits are saved first. *"No"* or **Cancel**
+   discards it.
+3. **Send.** Gmail sends it as a reply in the same thread (`In-Reply-To`, `References`, `threadId`).
+   The item records `{ type, intent, at, by, summary, to }` in `actions`, and reschedule or cancel
+   sets `awaiting_reply`. `whats_due` and `get_source` then say so: "Dentist appointment, on
+   Monday at 3:30 PM (you emailed Bright Smiles Dental to move Maya's cleaning to Thursday afternoon,
+   waiting for a reply)".
+4. **Watch.** The next "check my email" looks at those threads (metadata only, no model call). If the
+   sender answered, the item goes back to pending with "Bright Smiles Dental replied" in its history,
+   and Alexa says so.
+
+*"Renew the car insurance"* calls `start_renewal`. It returns the renewal link stored from the email
+(links are collected at sync time: https only, on the sender's domain or a known payment site, named
+like renew, pay or manage), shows it as a QR code, and marks the item "renewal in progress". It never
+renews anything; **Mark renewed** marks it done. With no link, it offers to email the sender and ask.
+
+Items without an email source (photos, WhatsApp, speech) have nobody to reply to, so Alexa says so
+and offers a reminder instead. Gmail tokens from before this feature work read-only until you
+reconnect (Settings shows **Reconnect Gmail to enable replies**).
 
 ## Connecting to Alexa+
 

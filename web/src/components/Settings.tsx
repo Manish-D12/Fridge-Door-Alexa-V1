@@ -54,16 +54,16 @@ export function SettingsMenu({ member }: { member: string }) {
                   target="_blank"
                   rel="noopener"
                   className={`mt-3 inline-flex items-center gap-2 rounded-full px-4 py-2 text-[16px] font-semibold transition active:scale-95 ${
-                    gmail.connected ? 'bg-white/10 text-white/80 hover:bg-white/20' : 'bg-alexa text-slate-950 hover:brightness-110'
+                    gmail.connected && gmail.canSend ? 'bg-white/10 text-white/80 hover:bg-white/20' : 'bg-alexa text-slate-950 hover:brightness-110'
                   }`}
                 >
-                  {gmail.connected ? 'Reconnect' : 'Connect Gmail'} <ExternalLink size={16} />
+                  {!gmail.connected ? 'Connect Gmail' : gmail.canSend ? 'Reconnect' : 'Reconnect Gmail to enable replies'} <ExternalLink size={16} />
                 </a>
               )}
             </div>
           </div>
           <p className="px-1 pt-3 text-[14px] leading-snug text-white/45">
-            Read-only access. Then say “Alexa, check my email” to add bills, orders and appointments from the last 14 days.
+            Reads recent mail, and sends only replies you approve on this screen. Say “Alexa, check my email” to add bills, orders and appointments from the last 14 days.
           </p>
         </div>
       )}
@@ -83,6 +83,7 @@ function GmailLine({ status, error }: { status: GmailStatus | null; error: strin
         <CircleCheck size={15} /> <span className="truncate">{status.account}</span>
       </span>
       <span className="text-white/45">{status.lastSyncAt ? `Last checked ${ago(status.lastSyncAt)}` : 'Not checked yet'}</span>
+      {!status.canSend && <span className="mt-1 block text-amber-200/90">Read-only: reconnect to enable replies.</span>}
     </div>
   );
 }

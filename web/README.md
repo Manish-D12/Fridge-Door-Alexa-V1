@@ -15,9 +15,10 @@ src/
     ├── Device.tsx       bezel, fabric base, 1280×800 screen scaled to fit
     ├── IdleScreen.tsx   clock, date, rotating "Coming up"
     ├── LightBar.tsx     the Alexa light bar
-    ├── Cards.tsx        due list, item, quoted source, ingest result, date confirmation, choices
+    ├── Cards.tsx        due list, item (with action history), quoted source, ingest result, date confirmation,
+    │                    choices, draft reply (editable, Send/Cancel), sent, renewal QR code
     ├── CameraSheet.tsx  getUserMedia snap or file upload, downscaled to JPEG
-    └── Settings.tsx     the gear menu: Connect Gmail and its status
+    └── Settings.tsx     the gear menu: Connect Gmail, its status, and "Reconnect to enable replies"
 ```
 
 `npm run dev` from the repo root starts this and the server together. Settings (`web/.env`):

@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { after, describe, it } from 'node:test';
 import type { AgentReply } from '@fridge-door/shared';
-import { Agent, type AgentOptions } from '../src/agent/agent.js';
+import { Agent, soundsLikeApproval, type AgentOptions } from '../src/agent/agent.js';
 import { Extractor } from '../src/extract/extractor.js';
 import { createApp } from '../src/http/app.js';
 import { silentLogger } from '../src/lib/logger.js';
+import type { OutgoingMail } from '../src/gmail/mail.js';
+import { FollowUps } from '../src/service/followups.js';
 import { ObligationService } from '../src/service/obligations.js';
-import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, raw, ScriptedChat, TZ, tempStore } from './helpers.js';
+import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, ob, raw, ScriptedChat, TZ, tempStore } from './helpers.js';
 
 /**
  * The agent against the real Express app: it connects to /mcp over Streamable
@@ -17,6 +19,18 @@ import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, raw, ScriptedChat, TZ, tempStor
 const API_KEY = 'agent-test-key-0123456789';
 const { store, cleanup } = await tempStore();
 for (const o of FIXTURES) await store.put(o);
+await store.put(
+  ob({
+    id: 'ortho',
+    type: 'appointment',
+    title: 'Orthodontist visit',
+    forWhom: 'Leo',
+    dueDate: '2026-10-27T21:00:00.000Z',
+    source: 'gmail',
+    sourceSnippet: "Leo's braces check is on Tuesday, October 27 at 2:00 PM.",
+    email: { gmailMessageId: 'o1', threadId: 'thread-o', messageIdHeader: '<o1@braces.com>', references: null, fromAddress: 'dr.lee@braces.com', fromName: 'Dr. Lee', subject: 'Braces check', demo: false },
+  }),
+);
 
 const SLIP = 'Field trip slip due 10/11. Bring a packed lunch that day.';
 const extractionModel = new FakeProvider(
@@ -38,11 +52,26 @@ const options: AgentOptions = {
   now: () => NOW,
 };
 const agent = new Agent(options);
+const sent: OutgoingMail[] = [];
+const followups = new FollowUps({
+  service,
+  provider: new (class extends FakeProvider {
+    override async generateJson() {
+      return { body: 'Hi Dr. Lee,\n\nCould we move Leo\'s braces check to Thursday?\n\nThanks,\nPriya', gist: "move Leo's braces check to Thursday" };
+    }
+  })(),
+  gmail: { send: async (mail) => (sent.push(mail), { messageId: 'g1' }) },
+  outbox: { send: async () => ({ messageId: 'unused' }) },
+  timeZone: TZ,
+  logger: silentLogger,
+  now: () => NOW,
+});
 const app = createApp({
   config: { HOST: '127.0.0.1', ALLOWED_HOSTS: undefined, CORS_ORIGINS: 'http://localhost:5173', API_KEY, DEFAULT_HOUSEHOLD_ID: HOUSEHOLD },
   service,
   logger: silentLogger,
   agent,
+  followups,
 });
 const server = app.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
@@ -83,7 +112,8 @@ describe('agent (MCP client)', () => {
 
     const [first, second] = model.chatRequests;
     assert.deepEqual(first!.tools.map((t) => t.name).sort(), [
-      'add_obligation', 'confirm_item', 'get_source', 'ingest_text', 'mark_done', 'next_up', 'sync_inbox', 'whats_due', 'who_handled',
+      'add_obligation', 'confirm_item', 'discard_draft', 'draft_followup', 'get_source', 'ingest_text', 'mark_done', 'next_up', 'send_followup',
+      'start_renewal', 'sync_inbox', 'whats_due', 'who_handled',
     ]);
     assert.ok(!('$schema' in first!.tools[0]!.parameters));
     assert.match(first!.system, /The person speaking is Priya/);
@@ -163,6 +193,97 @@ describe('agent (MCP client)', () => {
     await post('/chat', { message: 'Thanks', sessionId: photo.sessionId });
     const history = model.chatRequests[0]!.messages.map((m) => (m.role === 'user' ? m.text : '')).join('\n');
     assert.ok(history.includes(pending[1]!.id));
+  });
+
+  it('never sends a draft in the turn that wrote it, or without a clear yes', async () => {
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('draft_followup', { idOrTitle: 'orthodontist', intent: 'reschedule', details: 'Thursday' })] },
+      // The model jumps ahead and tries to send straight away.
+      { text: '', toolCalls: [call('send_followup', { draftId: 'PLACEHOLDER', confirmedBy: 'Priya' })] },
+      { text: "Here's a draft to Dr. Lee asking to move Leo's braces check to Thursday. Should I send it?", toolCalls: [] },
+    ]);
+    // Fill in the real draft id once it exists, as a model would.
+    const original = model.chat.bind(model);
+    model.chat = async (req) => {
+      const res = await original(req);
+      for (const c of res.toolCalls) {
+        if (c.name !== 'send_followup') continue;
+        const last = req.messages.at(-1)!;
+        const draft = last.role === 'tool' ? (last.results[0]!.content as { draft?: { id: string } }).draft : undefined;
+        if (draft) c.arguments.draftId = draft.id;
+      }
+      return res;
+    };
+    const drafted = await post('/chat', { message: "Ask the orthodontist to move Leo's appointment to Thursday" });
+    assert.deepEqual(drafted.toolCalls.map((c) => [c.name, c.isError]), [['draft_followup', false], ['send_followup', true]]);
+    assert.equal(sent.length, 0, 'blocked before it reached the server');
+    assert.equal(drafted.card?.kind, 'draft', 'the draft stays on screen');
+    if (drafted.card?.kind !== 'draft') return;
+    const draft = drafted.card.draft;
+    assert.equal(draft.to, 'dr.lee@braces.com');
+    assert.equal(draft.subject, 'Re: Braces check');
+
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('send_followup', { draftId: draft.id, confirmedBy: 'Priya' })] },
+      { text: 'Should I send it?', toolCalls: [] },
+    ]);
+    const unsure = await post('/chat', { message: 'Hmm, actually change it to Friday', sessionId: drafted.sessionId });
+    assert.deepEqual(unsure.toolCalls.map((c) => c.isError), [true]);
+    assert.equal(sent.length, 0);
+
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('send_followup', { draftId: draft.id, confirmedBy: 'Priya' })] },
+      { text: "Sent to Dr. Lee. I'll watch for their reply.", toolCalls: [] },
+    ]);
+    const yes = await post('/chat', { message: 'Yes, send it', sessionId: drafted.sessionId });
+    assert.deepEqual(yes.toolCalls.map((c) => [c.name, c.isError]), [['send_followup', false]]);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]!.to, 'dr.lee@braces.com');
+    assert.equal(yes.card?.kind, 'sent');
+    if (yes.card?.kind === 'sent') {
+      assert.equal(yes.card.delivery, 'gmail');
+      assert.equal(yes.card.item.status, 'awaiting_reply');
+    }
+  });
+
+  it('sends the edited draft from the Send button, and cancels from the Cancel button', async () => {
+    const ctx = { householdId: HOUSEHOLD, userId: 'Priya' };
+    const a = await followups.draft(ctx, { idOrTitle: 'orthodontist', intent: 'confirm' });
+    const edited = await post('/action', { tool: 'send_followup', arguments: { draftId: a.draft!.id, confirmedBy: 'Priya', body: 'Hi! Tuesday is fine.\n\nPriya' } });
+    assert.equal(edited.card?.kind, 'sent');
+    assert.equal(sent.at(-1)!.body, 'Hi! Tuesday is fine.\n\nPriya', 'exactly the text on screen');
+    assert.deepEqual(edited.toolCalls, [{ name: 'send_followup', arguments: { draftId: a.draft!.id, confirmedBy: 'Priya', edited: true }, isError: false }]);
+
+    const b = await followups.draft(ctx, { idOrTitle: 'orthodontist', intent: 'cancel' });
+    const cancelled = await post('/action', { tool: 'discard_draft', arguments: { draftId: b.draft!.id } });
+    assert.equal(cancelled.speech, "OK, I won't send it.");
+    const late = await post('/action', { tool: 'send_followup', arguments: { draftId: b.draft!.id, confirmedBy: 'Priya' } });
+    assert.match(late.speech, /cancelled/);
+
+    const dan = await post('/action', { tool: 'send_followup', arguments: { draftId: a.draft!.id, confirmedBy: 'Dan' } }, 'Dan');
+    assert.match(dan.speech, /already sent|Only Priya/);
+  });
+
+  it('shows a renewal card with the link, and marks it renewed from the button', async () => {
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('start_renewal', { idOrTitle: 'orthodontist' })] },
+      { text: 'There is no renewal link for that.', toolCalls: [] },
+    ]);
+    const none = await post('/chat', { message: 'Renew the orthodontist' });
+    assert.equal(none.card?.kind, 'item');
+    const turn = model.chatRequests[1]!.messages.at(-1)!;
+    assert.equal(turn.role, 'tool');
+
+    const done = await post('/action', { tool: 'mark_done', arguments: { idOrTitle: 'insurance', doneBy: 'Priya' } });
+    assert.equal(done.card?.kind, 'item');
+    if (done.card?.kind === 'item') assert.equal(done.card.item.status, 'done');
+  });
+
+  it('only counts a clear go-ahead as approval', () => {
+    for (const yes of ['Yes', 'send it', 'Yep, go ahead', 'OK send', 'sounds good']) assert.equal(soundsLikeApproval(yes), true, yes);
+    for (const no of ["No, don't send it", 'wait', 'Yes but change it to Friday', 'not yet', 'what does it say?', 'cancel it']) {
+      assert.equal(soundsLikeApproval(no), false, no);
+    }
   });
 
   it('validates input and allows the simulator origin', async () => {

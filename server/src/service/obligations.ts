@@ -2,11 +2,13 @@ import { randomUUID } from 'node:crypto';
 import {
   IsoDate,
   ObligationSchema,
+  type ActionLink,
   type AddObligationInput,
   type AddObligationResult,
   type ConfirmItemInput,
   type ConfirmItemResult,
   type DueRange,
+  type EmailRef,
   type ExtractedObligation,
   type GetSourceInput,
   type GetSourceResult,
@@ -19,8 +21,10 @@ import {
   type NextUpInput,
   type NextUpResult,
   type Obligation,
+  type ObligationAction,
   type ObligationType,
   type Source,
+  type Status,
   type WhatsDueInput,
   type WhatsDueResult,
   type WhoHandledInput,
@@ -115,6 +119,15 @@ interface IngestMeta {
   subject?: string;
 }
 
+/** One email for ingestEmails: its document text, and what replying to it needs. */
+export interface IncomingEmail {
+  text: string;
+  email: EmailRef | null;
+  links: ActionLink[];
+}
+
+type Extra = Pick<Obligation, 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions'> & Partial<Pick<Obligation, 'email' | 'links'>>;
+
 interface Saved {
   added: Obligation[];
   duplicates: Obligation[];
@@ -127,6 +140,15 @@ export function sameName(a: string | null | undefined, b: string | null | undefi
 
 export function isVisibleTo(o: Obligation, ctx: RequestContext): boolean {
   return !o.private || sameName(o.addedBy, ctx.userId);
+}
+
+/** Not done yet: pending, waiting for a reply, or mid-renewal. */
+export const isOpen = (o: Obligation) => o.status !== 'done';
+
+/** The latest follow-up still in flight, for "you asked to move it to Thursday, waiting for a reply". */
+function pendingAction(o: Obligation): ObligationAction | null {
+  if (o.status !== 'awaiting_reply' && o.status !== 'renewal_in_progress') return null;
+  return o.actions.findLast((a) => a.type === 'email_sent' || a.type === 'renewal_started') ?? null;
 }
 
 const byDueDate = (a: Obligation, b: Obligation) => Date.parse(a.dueDate) - Date.parse(b.dueDate);
@@ -161,7 +183,7 @@ export class ObligationService {
     const startOfToday = startOfLocalDay(today, timeZone);
 
     const pending = (await this.visible(ctx)).filter(
-      (o) => o.status === 'pending' && (!input.forWhom || sameName(o.forWhom, input.forWhom)),
+      (o) => isOpen(o) && (!input.forWhom || sameName(o.forWhom, input.forWhom)),
     );
     const items = pending
       .filter((o) => {
@@ -176,13 +198,19 @@ export class ObligationService {
     if (items.length === 0) {
       speech = `Nothing is due${who} ${spec.phrase}.`;
     } else {
-      const spoken = items.slice(0, MAX_SPOKEN_ITEMS).map((o) => this.describe(o, now));
+      const spoken = items.slice(0, MAX_SPOKEN_ITEMS).map((o) => this.describe(o, now, undefined, ctx));
       if (items.length > MAX_SPOKEN_ITEMS) spoken.push(`${items.length - MAX_SPOKEN_ITEMS} more`);
       const count = items.length === 1 ? 'One thing is' : `${items.length} things are`;
       speech = `${count} due${who} ${spec.phrase}: ${joinSpoken(spoken, 'and', '; ')}.`;
+      // Follow-ups in flight are worth hearing even when the item is past the first few.
+      const waiting = items.slice(MAX_SPOKEN_ITEMS).flatMap((o) => {
+        const pending = this.pendingPhrase(o, ctx);
+        return pending ? [`for ${o.title}, ${pending}`] : [];
+      });
+      if (waiting.length > 0) speech += ` Also, ${joinSpoken(waiting.slice(0, 2), 'and', '; ')}.`;
     }
     if (overdue.length > 0) {
-      const spoken = overdue.slice(0, MAX_SPOKEN_ITEMS).map((o) => this.describe(o, now, 'due '));
+      const spoken = overdue.slice(0, MAX_SPOKEN_ITEMS).map((o) => this.describe(o, now, 'due ', ctx));
       if (overdue.length > MAX_SPOKEN_ITEMS) spoken.push(`${overdue.length - MAX_SPOKEN_ITEMS} more`);
       speech += ` Also overdue: ${joinSpoken(spoken, 'and', '; ')}.`;
     }
@@ -203,14 +231,14 @@ export class ObligationService {
     const types = input.type ? [input.type] : NEXT_UP_DEFAULT_TYPES;
     const item =
       (await this.visible(ctx))
-        .filter((o) => o.status === 'pending' && types.includes(o.type) && Date.parse(o.dueDate) >= now)
+        .filter((o) => isOpen(o) && types.includes(o.type) && Date.parse(o.dueDate) >= now)
         .sort(byDueDate)[0] ?? null;
 
     const nouns = joinSpoken(types.map((t) => `${TYPE_NOUN[t]}s`), 'or');
     let speech: string;
     if (!item) speech = `There are no upcoming ${nouns}.`;
-    else if (input.type) speech = `The next ${TYPE_NOUN[input.type]} is ${this.describe(item, now)}.`;
-    else speech = `Next up: ${this.describe(item, now)}.`;
+    else if (input.type) speech = `The next ${TYPE_NOUN[input.type]} is ${this.describe(item, now, undefined, ctx)}.`;
+    else speech = `Next up: ${this.describe(item, now, undefined, ctx)}.`;
     return { speech, types, item };
   }
 
@@ -224,7 +252,7 @@ export class ObligationService {
 
   async markDone(ctx: RequestContext, input: MarkDoneInput): Promise<MarkDoneResult> {
     const now = this.now();
-    const target = resolveObligation(await this.visible(ctx), input.idOrTitle, 'pending', now);
+    const target = resolveObligation(await this.visible(ctx), input.idOrTitle, 'open', now);
     const doneBy = input.doneBy.trim();
 
     if (target.status === 'done') {
@@ -267,8 +295,9 @@ export class ObligationService {
         : item.sourceSnippet;
     const origin =
       item.source === 'manual' ? `was added by ${item.addedBy}, who said` : `came from ${SOURCE_PHRASE[item.source]}. It says`;
+    const pending = this.pendingPhrase(item, ctx);
     return {
-      speech: `${item.title} ${origin}: "${snippet}"`,
+      speech: `${item.title} ${origin}: "${snippet}"${pending ? ` Since then, ${pending}.` : ''}`,
       id: item.id,
       title: item.title,
       source: item.source,
@@ -276,6 +305,8 @@ export class ObligationService {
       confidence: item.confidence,
       addedBy: item.addedBy,
       createdAt: item.createdAt,
+      status: item.status,
+      actions: item.actions,
     };
   }
 
@@ -296,7 +327,7 @@ export class ObligationService {
    */
   async ingestEmails(
     ctx: RequestContext,
-    emails: string[],
+    emails: IncomingEmail[],
     onSaved: (index: number) => Promise<void> = async () => undefined,
   ): Promise<{ result: IngestResult; read: number }> {
     const extractor = this.requireExtractor();
@@ -304,7 +335,7 @@ export class ObligationService {
     const meta: IngestMeta = { kind: 'text', source: 'gmail', transcript: null, now, subject: emails.length === 1 ? 'that email' : 'those emails' };
     const all: Saved = { added: [], duplicates: [], skipped: [] };
     let read = 0;
-    for (const [i, text] of emails.entries()) {
+    for (const [i, { text, email, links }] of emails.entries()) {
       let extracted: ExtractionResult;
       try {
         extracted = await reading(() => extractor.extract(text, { sourceDescription: SOURCE_PHRASE.gmail, now }));
@@ -312,7 +343,7 @@ export class ObligationService {
         if (read === 0) throw err;
         break;
       }
-      const saved = await this.saveExtracted(ctx, extracted, meta);
+      const saved = await this.saveExtracted(ctx, extracted, meta, { email, links });
       all.added.push(...saved.added);
       all.duplicates.push(...saved.duplicates);
       all.skipped.push(...saved.skipped);
@@ -356,7 +387,39 @@ export class ObligationService {
     };
   }
 
+  /** One visible obligation by id or title words; ties are asked about, not guessed. */
+  async resolve(ctx: RequestContext, idOrTitle: string, prefer: 'open' | 'done' = 'open'): Promise<Obligation> {
+    return resolveObligation(await this.visible(ctx), idOrTitle, prefer, this.now());
+  }
+
+  /** Appends to the item's action history and optionally moves its status. Returns the saved item. */
+  async logAction(ctx: RequestContext, id: string, action: ObligationAction, status?: Status): Promise<Obligation> {
+    const existing = await this.store.get(ctx.householdId, id);
+    if (!existing || !isVisibleTo(existing, ctx)) throw notFound(`I couldn't find an item with id "${id}".`);
+    const item = ObligationSchema.parse({
+      ...existing,
+      // Done stays done: a late reply or a renewal click doesn't reopen it.
+      status: status && existing.status !== 'done' ? status : existing.status,
+      actions: [...existing.actions, action].slice(-50),
+    });
+    await this.store.put(item);
+    return item;
+  }
+
+  /** Open items from real Gmail whose sender hasn't answered our follow-up yet. */
+  async awaitingReply(ctx: RequestContext): Promise<Obligation[]> {
+    return (await this.visible(ctx)).filter((o) => o.status === 'awaiting_reply' && o.email && !o.email.demo);
+  }
+
   // -------------------------------------------------------------------------
+
+  /** "you asked to move it to Thursday, waiting for a reply" for an item with a follow-up in flight. */
+  private pendingPhrase(o: Obligation, ctx: RequestContext): string | null {
+    const action = pendingAction(o);
+    if (!action) return null;
+    const who = sameName(action.by, ctx.userId) ? 'you' : action.by;
+    return o.status === 'awaiting_reply' ? `${who} ${action.summary}, waiting for a reply` : `${who} ${action.summary}`;
+  }
 
   private requireExtractor(): Extractor {
     if (!this.opts.extractor) {
@@ -369,11 +432,7 @@ export class ObligationService {
     ctx: RequestContext,
     input: AddObligationInput,
     now: number,
-    extra: Pick<Obligation, 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions'> = {
-      needsConfirmation: false,
-      confirmationQuestion: null,
-      confirmationOptions: [],
-    },
+    extra: Extra = { needsConfirmation: false, confirmationQuestion: null, confirmationOptions: [] },
   ): Promise<Obligation> {
     const addedBy = input.addedBy?.trim() || ctx.userId;
     const isPrivate = input.private ?? false;
@@ -400,6 +459,9 @@ export class ObligationService {
       doneBy: null,
       doneAt: null,
       createdAt: new Date(now).toISOString(),
+      email: null,
+      links: [],
+      actions: [],
       ...extra,
     };
     const item = ObligationSchema.parse(candidate);
@@ -416,6 +478,7 @@ export class ObligationService {
     ctx: RequestContext,
     extracted: ExtractionResult,
     meta: IngestMeta,
+    origin: Pick<Extra, 'email' | 'links'> = {},
   ): Promise<Saved> {
     const known = await this.visible(ctx);
     const added: Obligation[] = [];
@@ -434,7 +497,7 @@ export class ObligationService {
         continue;
       }
       const { needsConfirmation, confirmationQuestion, confirmationOptions, ...fields } = e;
-      const item = await this.create(ctx, { ...fields, source: meta.source }, meta.now, { needsConfirmation, confirmationQuestion, confirmationOptions });
+      const item = await this.create(ctx, { ...fields, source: meta.source }, meta.now, { needsConfirmation, confirmationQuestion, confirmationOptions, ...origin });
       added.push(item);
       known.push(item);
     }
@@ -485,14 +548,16 @@ export class ObligationService {
     return (await this.store.list(ctx.householdId)).filter((o) => isVisibleTo(o, ctx));
   }
 
-  /** "Water bill, $84.20, due tomorrow" style phrase for speech. */
-  private describe(o: Obligation, now: number, verb = DUE_VERB[o.type]): string {
+  /** "Water bill, $84.20, due tomorrow" style phrase for speech; given ctx, plus any follow-up in flight. */
+  private describe(o: Obligation, now: number, verb = DUE_VERB[o.type], ctx?: RequestContext): string {
     let s = o.title;
     if (o.amount !== null) {
       s += `, ${new Intl.NumberFormat('en-US', { style: 'currency', currency: o.currency }).format(o.amount)}`;
     }
     if (o.forWhom && !normalize(o.title).split(' ').includes(normalize(o.forWhom))) s += `, for ${o.forWhom}`;
-    return `${s}, ${verb}${spokenWhen(o.dueDate, now, this.opts.timeZone)}`;
+    s += `, ${verb}${spokenWhen(o.dueDate, now, this.opts.timeZone)}`;
+    const pending = ctx && this.pendingPhrase(o, ctx);
+    return pending ? `${s} (${pending})` : s;
   }
 
   /** Date-only values mean "by the end of that day" in the household time zone. */

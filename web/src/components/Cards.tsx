@@ -1,6 +1,34 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AgentCard, GetSourceResult, IngestResult, Obligation, SyncInboxResult, WhatsDueResult } from '@fridge-door/shared';
-import { CalendarCheck, CircleAlert, CircleCheck, CircleHelp, Lock, Quote, ShieldCheck, Sparkles } from 'lucide-react';
+import QRCode from 'qrcode';
+import type {
+  ActionLink,
+  AgentCard,
+  FollowupDraft,
+  GetSourceResult,
+  IngestResult,
+  Obligation,
+  ObligationAction,
+  SyncInboxResult,
+  WhatsDueResult,
+} from '@fridge-door/shared';
+import {
+  CalendarCheck,
+  CircleAlert,
+  CircleCheck,
+  CircleHelp,
+  ExternalLink,
+  Hourglass,
+  Lock,
+  Mail,
+  MailCheck,
+  Quote,
+  RefreshCw,
+  Reply,
+  Send,
+  ShieldCheck,
+  Smartphone,
+  Sparkles,
+} from 'lucide-react';
 import { ago, isOverdue, money, plainDate, SOURCE_NOUN, TYPE_LABEL, when, whenText } from '../format';
 import { SOURCE_ICON, TypeIcon } from './TypeIcon';
 
@@ -9,6 +37,10 @@ export interface CardActions {
   confirm(id: string, date: string): void;
   /** Say something on the user's behalf (tapping a choice). */
   say(text: string): void;
+  /** The Send button: `body` only when it was edited. */
+  send(draftId: string, body: string | undefined): void;
+  discard(draftId: string): void;
+  markDone(id: string): void;
 }
 
 export function Card({ card, tz, now, actions }: { card: AgentCard; tz: string; now: number; actions: CardActions }) {
@@ -21,6 +53,12 @@ export function Card({ card, tz, now, actions }: { card: AgentCard; tz: string; 
       return <SourceCard result={card.result} item={card.item} tz={tz} now={now} />;
     case 'ingest':
       return <IngestCard result={card.result} tz={tz} now={now} actions={actions} />;
+    case 'draft':
+      return <DraftCard draft={card.draft} actions={actions} />;
+    case 'sent':
+      return <SentCard draft={card.draft} item={card.item} demo={card.delivery === 'demo_outbox'} now={now} />;
+    case 'renewal':
+      return <RenewalCard item={card.item} link={card.link} tz={tz} now={now} actions={actions} />;
     case 'choices':
       return (
         <Panel icon={<CircleHelp size={20} />} heading={card.heading}>
@@ -136,7 +174,8 @@ function Row({ item, tz, now, badge }: { item: Obligation; tz: string; now: numb
             </span>
           )}
           {done && item.doneBy && <span className="text-emerald-300">Done by {item.doneBy}</span>}
-          {!item.forWhom && !item.private && !done && <span>{TYPE_LABEL[item.type]}</span>}
+          <StatusPill status={item.status} />
+          {!item.forWhom && !item.private && item.status === 'pending' && <span>{TYPE_LABEL[item.type]}</span>}
           {badge}
         </div>
       </div>
@@ -181,10 +220,15 @@ function ItemCard({ heading, item, tz, now }: { heading: string; item: Obligatio
             Handled by <b className="font-semibold text-white">{item.doneBy ?? 'someone'}</b>
             {item.doneAt && <span className="text-emerald-200/70"> · {ago(item.doneAt, now)}</span>}
           </span>
+        ) : item.status === 'awaiting_reply' ? (
+          <span>Waiting for a reply{item.email?.fromName ? ` from ${item.email.fromName}` : ''}</span>
+        ) : item.status === 'renewal_in_progress' ? (
+          <span>Renewal in progress · tap Mark renewed when it’s done</span>
         ) : (
           <span>Not done yet · added by {item.addedBy}</span>
         )}
       </div>
+      <Timeline actions={item.actions} now={now} />
     </Panel>
   );
 }
@@ -213,6 +257,7 @@ function SourceCard({ result, item, tz, now }: { result: GetSourceResult; item: 
       <div className="mt-4 flex items-center gap-2 text-[16px] text-white/50">
         <ShieldCheck size={15} /> Quoted exactly · added by {result.addedBy} · {ago(result.createdAt, now)}
       </div>
+      <Timeline actions={result.actions} now={now} />
     </Panel>
   );
 }
@@ -283,5 +328,197 @@ function ConfirmBlock({ question, options, onPick }: { question: string; options
         ))}
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up actions
+// ---------------------------------------------------------------------------
+
+function StatusPill({ status }: { status: Obligation['status'] }) {
+  if (status === 'awaiting_reply') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-sky-300/15 px-2.5 py-0.5 text-sky-200">
+        <Hourglass size={13} /> Waiting for reply
+      </span>
+    );
+  }
+  if (status === 'renewal_in_progress') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-violet-300/15 px-2.5 py-0.5 text-violet-200">
+        <RefreshCw size={13} /> Renewing
+      </span>
+    );
+  }
+  return null;
+}
+
+const ACTION_ICON: Record<ObligationAction['type'], React.ReactNode> = {
+  email_sent: <Send size={16} />,
+  reply_received: <Reply size={16} />,
+  renewal_started: <RefreshCw size={16} />,
+};
+
+/** What has been done about an item, oldest first. */
+function Timeline({ actions, now }: { actions: ObligationAction[]; now: number }) {
+  if (actions.length === 0) return null;
+  return (
+    <div className="mt-5">
+      <div className="mb-2 text-[14px] font-semibold uppercase tracking-[0.14em] text-white/40">History</div>
+      <ol className="relative ml-3 border-l border-white/15">
+        {actions.map((a, i) => (
+          <li key={`${a.at}-${i}`} className="relative pb-3 pl-6 last:pb-0">
+            <span className="absolute -left-[13px] top-0.5 flex size-[26px] items-center justify-center rounded-full bg-[#1b2438] text-alexa ring-1 ring-white/15">
+              {ACTION_ICON[a.type]}
+            </span>
+            <div className="text-[18px] leading-snug text-white/85">
+              <b className="font-semibold text-white">{a.by}</b> {a.summary}
+            </div>
+            <div className="text-[14px] text-white/45">{ago(a.at, now)}</div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function DraftCard({ draft, actions }: { draft: FollowupDraft; actions: CardActions }) {
+  const [body, setBody] = useState(draft.body);
+  const [done, setDone] = useState<'sent' | 'cancelled' | null>(null);
+  const edited = body.trim() !== draft.body;
+  return (
+    <Panel
+      icon={<Mail size={20} />}
+      heading="Draft reply"
+      aside={<span className="rounded-full bg-amber-300/15 px-3 py-1 text-[15px] font-medium text-amber-200">Not sent yet</span>}
+    >
+      <div className="overflow-hidden rounded-2xl bg-[#f6f3ea] text-[#1f2430]">
+        <dl className="grid grid-cols-[88px_1fr] gap-x-3 gap-y-1.5 border-b border-black/10 bg-black/[0.04] px-5 py-3 text-[17px]">
+          <dt className="font-semibold uppercase tracking-[0.1em] text-[#5b6170]">To</dt>
+          <dd className="min-w-0 truncate">
+            {draft.toName && <span className="font-semibold">{draft.toName} </span>}
+            <span className="text-[#5b6170]">&lt;{draft.to}&gt;</span>
+          </dd>
+          <dt className="font-semibold uppercase tracking-[0.1em] text-[#5b6170]">Subject</dt>
+          <dd className="min-w-0 truncate">{draft.subject}</dd>
+        </dl>
+        <textarea
+          aria-label="Email body"
+          value={body}
+          disabled={done !== null}
+          onChange={(e) => setBody(e.target.value)}
+          rows={7}
+          className="block w-full resize-none bg-transparent px-5 py-4 font-serif text-[20px] leading-relaxed outline-none focus:bg-white/60 disabled:opacity-70"
+        />
+      </div>
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          disabled={done !== null || !body.trim()}
+          onClick={() => {
+            setDone('sent');
+            actions.send(draft.id, edited ? body.trim() : undefined);
+          }}
+          className="inline-flex items-center gap-2 rounded-full bg-alexa px-7 py-3.5 text-[21px] font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:opacity-40"
+        >
+          <Send size={20} /> Send
+        </button>
+        <button
+          disabled={done !== null}
+          onClick={() => {
+            setDone('cancelled');
+            actions.discard(draft.id);
+          }}
+          className="rounded-full bg-white/10 px-6 py-3.5 text-[21px] font-medium text-white/85 transition hover:bg-white/20 active:scale-95 disabled:opacity-40"
+        >
+          Cancel
+        </button>
+        <span className="ml-auto text-right text-[15px] leading-snug text-white/50">
+          {draft.demo ? 'Sample item: goes to the demo outbox' : edited ? 'Your edits will be sent' : 'Or say “send it”'}
+        </span>
+      </div>
+    </Panel>
+  );
+}
+
+function SentCard({ draft, item, demo, now }: { draft: FollowupDraft; item: Obligation; demo: boolean; now: number }) {
+  return (
+    <Panel icon={<MailCheck size={20} />} heading={demo ? 'Saved to demo outbox' : 'Sent'}>
+      <div className="flex items-center gap-5">
+        <span className="pop-in flex size-[76px] shrink-0 items-center justify-center rounded-full bg-emerald-400/20 text-emerald-300 ring-1 ring-emerald-300/40">
+          <CircleCheck size={44} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[28px] font-semibold leading-tight">{demo ? 'Saved, not sent' : 'Sent'}</div>
+          <div className="truncate text-[21px] text-emerald-200" title={draft.to}>
+            {demo ? 'Reply to ' : 'To '}
+            {draft.to}
+          </div>
+          <div className="mt-1 text-[19px] text-white/65">
+            {demo ? 'This is sample data, so nothing left Gmail.' : item.status === 'awaiting_reply' ? "I'll watch for their reply." : 'In the same email thread.'}
+          </div>
+        </div>
+      </div>
+      <div className="mt-5 rounded-2xl bg-white/[0.05] px-5 py-4">
+        <div className="truncate text-[17px] font-medium text-white/80">{draft.subject}</div>
+        <div className="mt-1 line-clamp-3 whitespace-pre-line text-[17px] leading-snug text-white/50">{draft.body}</div>
+      </div>
+      <Timeline actions={item.actions} now={now} />
+    </Panel>
+  );
+}
+
+function RenewalCard({ item, link, tz, now, actions }: { item: Obligation; link: ActionLink; tz: string; now: number; actions: CardActions }) {
+  const [qr, setQr] = useState<string | null>(null);
+  const [marked, setMarked] = useState(item.status === 'done');
+  useEffect(() => {
+    let live = true;
+    QRCode.toString(link.url, { type: 'svg', margin: 1, errorCorrectionLevel: 'M', color: { dark: '#0b1020', light: '#ffffff' } })
+      .then((svg) => live && setQr(`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`))
+      .catch(() => live && setQr(null));
+    return () => {
+      live = false;
+    };
+  }, [link.url]);
+  const host = new URL(link.url).hostname.replace(/^www\./, '');
+  const amount = money(item.amount, item.currency);
+  return (
+    <Panel icon={<RefreshCw size={20} />} heading="Renew on your phone">
+      <div className="flex items-start gap-7">
+        <div className="flex size-[232px] shrink-0 items-center justify-center rounded-3xl bg-white p-3 shadow-xl">
+          {qr ? <img src={qr} alt={`QR code for ${host}`} className="size-full" /> : <span className="text-[15px] text-slate-500">Making code…</span>}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[30px] font-semibold leading-tight tracking-tight">{item.title}</div>
+          <div className="mt-2 flex items-baseline gap-4 text-[21px]">
+            <span className="text-alexa">Due {whenText(item.dueDate, tz, now)}</span>
+            {amount && <span className="font-semibold tabular-nums">{amount}</span>}
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-[17px] text-white/60">
+            <ShieldCheck size={16} className="text-emerald-300" /> {host} · from the original email
+          </div>
+          <p className="mt-3 text-[16px] leading-snug text-white/50">Scan to finish on your phone. Alexa can’t renew or pay for you.</p>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <a
+              href={link.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-full bg-white/10 px-5 py-3 text-[18px] font-medium text-white/90 transition hover:bg-white/20 active:scale-95"
+            >
+              <Smartphone size={19} /> Open on phone <ExternalLink size={15} className="text-white/50" />
+            </a>
+            <button
+              disabled={marked}
+              onClick={() => {
+                setMarked(true);
+                actions.markDone(item.id);
+              }}
+              className="inline-flex items-center gap-2 rounded-full bg-alexa px-5 py-3 text-[18px] font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:opacity-40"
+            >
+              <CircleCheck size={19} /> {marked ? 'Marked renewed' : 'Mark renewed'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Panel>
   );
 }

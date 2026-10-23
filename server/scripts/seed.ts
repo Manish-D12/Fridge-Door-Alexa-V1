@@ -10,6 +10,11 @@
  * A reset also forgets which emails Gmail sync has read (the connection stays),
  * so "check my email" finds them again. Their extraction is cached, so that
  * costs no model calls.
+ *
+ * The dentist appointment and the car insurance renewal carry a Gmail-style
+ * source (sender, thread, and for the insurance a renewal link) so follow-up
+ * actions can be demoed. They are marked demo: those emails were never in
+ * anyone's inbox, so replies go to the local demo outbox, not Gmail.
  */
 import { ObligationSchema, type Obligation } from '@fridge-door/shared';
 import { loadConfig } from '../src/config.js';
@@ -40,9 +45,22 @@ const time = (ms: number) => fmt(ms, { hour: 'numeric', minute: '2-digit' });
 
 type Seed = Omit<
   Obligation,
-  'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private' | 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions'
+  | 'householdId' | 'currency' | 'status' | 'doneBy' | 'doneAt' | 'createdAt' | 'private'
+  | 'needsConfirmation' | 'confirmationQuestion' | 'confirmationOptions' | 'email' | 'links' | 'actions'
 > &
-  Partial<Pick<Obligation, 'status' | 'doneBy' | 'doneAt' | 'private'>> & { createdDaysAgo: number };
+  Partial<Pick<Obligation, 'status' | 'doneBy' | 'doneAt' | 'private' | 'email' | 'links'>> & { createdDaysAgo: number };
+
+/** A sample email: replies to it are saved to the demo outbox. */
+const demoEmail = (id: string, fromName: string, fromAddress: string, subject: string): Obligation['email'] => ({
+  gmailMessageId: `demo-${id}`,
+  threadId: `demo-${id}`,
+  messageIdHeader: `<${id}@${fromAddress.split('@')[1]}>`,
+  references: null,
+  fromAddress,
+  fromName,
+  subject,
+  demo: true,
+});
 
 const fieldTripDue = by(2);
 const fieldTripDate = by(14);
@@ -99,10 +117,12 @@ const seeds: Seed[] = [
     source: 'gmail',
     sourceSnippet:
       `Your Harborline auto policy HL-55102 renews on ${shortDate(insuranceDue)}. ` +
-      `Your new 6-month premium is $612.00. If you're enrolled in AutoPay, no action is needed.`,
+      `Your new 6-month premium is $612.00. Renew online before then to keep your coverage.`,
     confidence: 0.95,
     addedBy: 'Dan',
     createdDaysAgo: 6,
+    email: demoEmail('harborline-renewal', 'Harborline Insurance', 'renewals@harborline.example', 'Your auto policy HL-55102 is up for renewal'),
+    links: [{ url: 'https://www.harborline.example/policies/HL-55102/renew', kind: 'renewal', label: 'Renew your policy' }],
   },
   {
     id: 'seed-amazon-delivery',
@@ -126,13 +146,14 @@ const seeds: Seed[] = [
     dueDate: iso(dentistAt),
     amount: null,
     forWhom: 'Maya',
-    source: 'whatsapp',
+    source: 'gmail',
     sourceSnippet:
-      `Hi! Bright Smiles Dental confirming Maya's cleaning with Dr. Okafor on ${longDate(dentistAt)} at ${time(dentistAt)}. ` +
-      `Reply C to confirm or call us to reschedule.`,
+      `Hi Priya, this is Bright Smiles Dental confirming Maya's cleaning with Dr. Okafor on ${longDate(dentistAt)} at ${time(dentistAt)}. ` +
+      `Just reply to this email if you need to reschedule.`,
     confidence: 0.9,
     addedBy: 'Priya',
     createdDaysAgo: 5,
+    email: demoEmail('bright-smiles-cleaning', 'Bright Smiles Dental', 'dr.smile@brightsmiles.example', "Maya's cleaning appointment"),
   },
   {
     id: 'seed-movie-booking',
@@ -224,6 +245,9 @@ const obligations = seeds.map(({ createdDaysAgo, ...s }) =>
     needsConfirmation: false,
     confirmationQuestion: null,
     confirmationOptions: [],
+    email: null,
+    links: [],
+    actions: [],
     createdAt: iso(at(-createdDaysAgo, 9)),
     ...s,
   } satisfies Obligation),

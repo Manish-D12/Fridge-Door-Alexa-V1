@@ -52,6 +52,8 @@ const EnvSchema = z.object({
   GMAIL_STATE_FILE: z.string().default(path.join(packageRoot, '.data', 'gmail.json')),
   /** Emails sent to extraction per sync, at most (one model call each, unless cached). */
   GMAIL_SYNC_MAX_EMAILS: z.coerce.number().int().min(1).max(20).default(5),
+  /** Replies to seed (demo) items are saved here as .eml files instead of being sent. */
+  DEMO_OUTBOX_DIR: z.string().default(path.join(packageRoot, '.data', 'outbox')),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

@@ -11,6 +11,7 @@ import type { GmailSync } from '../gmail/sync.js';
 import { AppError, HTTP_STATUS } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import { createMcpServer, SERVER_NAME, SERVER_VERSION } from '../mcp/server.js';
+import type { FollowUps } from '../service/followups.js';
 import type { ObligationService } from '../service/obligations.js';
 import { createAgentRouter } from './agent.js';
 import { bearerAuth, requestContext } from './context.js';
@@ -25,6 +26,8 @@ export interface AppDeps {
   agent?: Agent;
   /** Gmail sync: /auth/google, /api/gmail and the sync_inbox tool. Without it the tool says it isn't set up. */
   gmail?: GmailSync;
+  /** draft_followup, send_followup, start_renewal. Without it those tools say they aren't set up. */
+  followups?: FollowUps;
 }
 
 const csv = (s: string | undefined) => (s ?? '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -34,7 +37,7 @@ const JSON_BODY_LIMIT = '12mb';
 
 const jsonRpcError = (code: number, message: string) => ({ jsonrpc: '2.0' as const, error: { code, message }, id: null });
 
-export function createApp({ config, service, logger, agent, gmail }: AppDeps): Express {
+export function createApp({ config, service, logger, agent, gmail, followups }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
 
@@ -55,7 +58,7 @@ export function createApp({ config, service, logger, agent, gmail }: AppDeps): E
   // --- MCP: Streamable HTTP, stateless (a fresh server + transport per request).
   app.post('/mcp', async (req, res) => {
     const ctx = requestContext(req, config.DEFAULT_HOUSEHOLD_ID);
-    const server = createMcpServer(service, ctx, logger, gmail);
+    const server = createMcpServer(service, ctx, logger, gmail, followups);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => {
       void transport.close();

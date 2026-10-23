@@ -48,7 +48,7 @@ export class LocalJsonStore implements ObligationStore {
     return this.mutate((data) => {
       const existing = data.obligations.find((o) => o.householdId === householdId && o.id === id);
       if (!existing) return null;
-      if (existing.status === 'pending') {
+      if (existing.status !== 'done') {
         existing.status = 'done';
         existing.doneBy = doneBy;
         existing.doneAt = doneAt;

@@ -19,9 +19,22 @@ export const SOURCES = ['gmail', 'whatsapp', 'photo', 'manual'] as const;
 export const Source = z.enum(SOURCES);
 export type Source = z.infer<typeof Source>;
 
-export const STATUSES = ['pending', 'done'] as const;
+/** Everything except "done" is still open: it shows in whats_due and can be marked done. */
+export const STATUSES = ['pending', 'awaiting_reply', 'renewal_in_progress', 'done'] as const;
 export const Status = z.enum(STATUSES);
 export type Status = z.infer<typeof Status>;
+
+export const FOLLOWUP_INTENTS = ['reschedule', 'cancel', 'request_extension', 'confirm', 'ask_question'] as const;
+export const FollowupIntent = z.enum(FOLLOWUP_INTENTS);
+export type FollowupIntent = z.infer<typeof FollowupIntent>;
+
+export const LINK_KINDS = ['renewal', 'payment', 'manage'] as const;
+export const LinkKind = z.enum(LINK_KINDS);
+export type LinkKind = z.infer<typeof LinkKind>;
+
+export const ACTION_TYPES = ['email_sent', 'reply_received', 'renewal_started'] as const;
+export const ActionType = z.enum(ACTION_TYPES);
+export type ActionType = z.infer<typeof ActionType>;
 
 export const DUE_RANGES = ['today', 'tomorrow', 'week', 'month'] as const;
 export const DueRange = z.enum(DUE_RANGES);
@@ -47,6 +60,45 @@ const PersonName = z.string().trim().min(1).max(100);
 // ---------------------------------------------------------------------------
 // Obligation record
 // ---------------------------------------------------------------------------
+
+/** The Gmail message an obligation was read from: what a reply needs. */
+export const EmailRef = z.object({
+  gmailMessageId: z.string().min(1).max(200),
+  threadId: z.string().min(1).max(200),
+  /** The original's RFC 5322 Message-ID, for In-Reply-To and References. */
+  messageIdHeader: z.string().max(1000).nullable(),
+  references: z.string().max(4000).nullable(),
+  /** Replies only ever go here. */
+  fromAddress: z.email(),
+  fromName: z.string().max(200).nullable(),
+  subject: z.string().max(500),
+  /** Seed data, not a real message: replies go to the local demo outbox instead of Gmail. */
+  demo: z.boolean().default(false),
+});
+export type EmailRef = z.infer<typeof EmailRef>;
+
+/** A renewal, payment or account link found in the source email (https, on the sender's or a known biller's domain). */
+export const ActionLink = z.object({
+  url: z.string().max(2000).regex(/^https:\/\/\S+$/),
+  kind: LinkKind,
+  /** The link text, or the host when there was none. */
+  label: z.string().max(200),
+});
+export type ActionLink = z.infer<typeof ActionLink>;
+
+/** Something done about an obligation, newest last. */
+export const ObligationAction = z.object({
+  type: ActionType,
+  intent: FollowupIntent.nullable(),
+  at: IsoDateTime,
+  /** Household member, or the sender for reply_received. */
+  by: z.string().min(1).max(200),
+  /** Past tense, readable after a name: "asked to move it to Thursday". */
+  summary: z.string().min(1).max(300),
+  /** Recipient of email_sent. */
+  to: z.string().max(320).nullable(),
+});
+export type ObligationAction = z.infer<typeof ObligationAction>;
 
 export const ObligationSchema = z.object({
   id: z.string().min(1),
@@ -76,6 +128,10 @@ export const ObligationSchema = z.object({
   confirmationQuestion: z.string().min(1).max(500).nullable().default(null),
   /** The local dates (YYYY-MM-DD) to offer when needsConfirmation is set, earliest first. */
   confirmationOptions: z.array(IsoDate).max(4).default([]),
+  /** Set for items read from Gmail; follow-up emails reply to it. */
+  email: EmailRef.nullable().default(null),
+  links: z.array(ActionLink).max(5).default([]),
+  actions: z.array(ObligationAction).max(50).default([]),
 });
 export type Obligation = z.infer<typeof ObligationSchema>;
 
@@ -154,6 +210,42 @@ export const ConfirmItemInput = z.object({
     ),
 });
 export type ConfirmItemInput = z.infer<typeof ConfirmItemInput>;
+
+export const DraftFollowupInput = z.object({
+  idOrTitle: z.string().trim().min(1).describe('The obligation id, or words from its title such as "dentist".'),
+  intent: FollowupIntent.describe(
+    'What the email asks for: "reschedule", "cancel", "request_extension" (more time to pay or submit), "confirm" (yes, we will be there), or "ask_question".',
+  ),
+  details: z
+    .string()
+    .trim()
+    .max(500)
+    .optional()
+    .describe('The person\'s own words about what they want, e.g. "move it to Thursday afternoon" or "ask if they take card". Omit if they said nothing more.'),
+});
+export type DraftFollowupInput = z.infer<typeof DraftFollowupInput>;
+
+export const SendFollowupInput = z.object({
+  draftId: z.string().trim().min(1).describe('The draft id from draft_followup.'),
+  confirmedBy: PersonName.describe('The household member who said to send it. Must be the person who asked for the draft.'),
+});
+export type SendFollowupInput = z.infer<typeof SendFollowupInput>;
+
+export const DiscardDraftInput = z.object({
+  draftId: z.string().trim().min(1).describe('The draft id from draft_followup.'),
+});
+export type DiscardDraftInput = z.infer<typeof DiscardDraftInput>;
+
+export const UpdateDraftInput = z.object({
+  draftId: z.string().trim().min(1).describe('The draft id from draft_followup.'),
+  body: z.string().trim().min(1).max(4000).describe('The edited email body.'),
+});
+export type UpdateDraftInput = z.infer<typeof UpdateDraftInput>;
+
+export const StartRenewalInput = z.object({
+  idOrTitle: z.string().trim().min(1).describe('The obligation id, or words from its title such as "car insurance".'),
+});
+export type StartRenewalInput = z.infer<typeof StartRenewalInput>;
 
 /**
  * One obligation found by automatic extraction: the add_obligation fields plus
@@ -245,8 +337,68 @@ export const GetSourceResult = z.object({
   confidence: z.number(),
   addedBy: z.string(),
   createdAt: IsoDateTime,
+  status: Status,
+  /** What has been done about it so far, oldest first. */
+  actions: z.array(ObligationAction),
 });
 export type GetSourceResult = z.infer<typeof GetSourceResult>;
+
+export const FollowupDraft = z.object({
+  id: z.string(),
+  obligationId: z.string(),
+  intent: FollowupIntent,
+  /** Always the sender of the obligation's source email. */
+  to: z.string(),
+  toName: z.string().nullable(),
+  subject: z.string(),
+  body: z.string(),
+  /** What the email asks for, e.g. "move Maya's cleaning to Thursday". */
+  gist: z.string(),
+  createdBy: z.string(),
+  createdAt: IsoDateTime,
+  /** After this the draft can't be sent; ask for a new one. */
+  expiresAt: IsoDateTime,
+  /** Seed data: sending saves to the demo outbox instead of Gmail. */
+  demo: z.boolean(),
+  sentAt: IsoDateTime.nullable(),
+});
+export type FollowupDraft = z.infer<typeof FollowupDraft>;
+
+export const DraftFollowupResult = z.object({
+  speech: Speech,
+  draft: FollowupDraft.nullable().describe('Null when there is nobody to email; speech says why and what to do instead.'),
+  item: ObligationSchema,
+  reason: z.enum(['no_sender', 'no_reply_address']).nullable(),
+});
+export type DraftFollowupResult = z.infer<typeof DraftFollowupResult>;
+
+export const SendFollowupResult = z.object({
+  speech: Speech,
+  draft: FollowupDraft,
+  item: ObligationSchema,
+  delivery: z.enum(['gmail', 'demo_outbox']),
+});
+export type SendFollowupResult = z.infer<typeof SendFollowupResult>;
+
+export const DiscardDraftResult = z.object({
+  speech: Speech,
+  draftId: z.string(),
+});
+export type DiscardDraftResult = z.infer<typeof DiscardDraftResult>;
+
+export const UpdateDraftResult = z.object({
+  speech: Speech,
+  draft: FollowupDraft,
+  item: ObligationSchema,
+});
+export type UpdateDraftResult = z.infer<typeof UpdateDraftResult>;
+
+export const StartRenewalResult = z.object({
+  speech: Speech,
+  item: ObligationSchema,
+  link: ActionLink.nullable().describe('Null when the source email had no renewal or account link.'),
+});
+export type StartRenewalResult = z.infer<typeof StartRenewalResult>;
 
 export const ConfirmItemResult = z.object({
   speech: Speech,
@@ -288,6 +440,9 @@ export const SyncInboxResult = IngestResult.extend({
     read: z.number().int().describe('Sent to extraction this time.'),
     remaining: z.number().int().describe('Relevant but over the per-sync limit; the next sync reads them.'),
   }),
+  replies: z
+    .array(z.object({ id: z.string(), title: z.string(), from: z.string() }))
+    .describe('Items awaiting a reply whose thread now has one.'),
 });
 export type SyncInboxResult = z.infer<typeof SyncInboxResult>;
 
@@ -295,6 +450,8 @@ export const GmailStatus = z.object({
   /** Google OAuth client settings are present on the server. */
   configured: z.boolean(),
   connected: z.boolean(),
+  /** The stored grant includes gmail.send; without it, reconnect to enable replies. */
+  canSend: z.boolean(),
   account: z.string().nullable(),
   connectedAt: IsoDateTime.nullable(),
   lastSyncAt: IsoDateTime.nullable(),
@@ -317,10 +474,21 @@ export const AgentChatInput = z.object({
 });
 export type AgentChatInput = z.infer<typeof AgentChatInput>;
 
-/** Screen actions that call one MCP tool directly, without the model choosing. */
+const SessionId = z.string().max(100).optional();
+
+/** Screen actions that call MCP tools directly, without the model choosing. */
 export const AgentActionInput = z.discriminatedUnion('tool', [
-  z.object({ tool: z.literal('ingest_image'), arguments: IngestImageInput, sessionId: z.string().max(100).optional() }),
-  z.object({ tool: z.literal('confirm_item'), arguments: ConfirmItemInput, sessionId: z.string().max(100).optional() }),
+  z.object({ tool: z.literal('ingest_image'), arguments: IngestImageInput, sessionId: SessionId }),
+  z.object({ tool: z.literal('confirm_item'), arguments: ConfirmItemInput, sessionId: SessionId }),
+  /** The Send button. With `body`, the edited text is saved to the draft first, then exactly that is sent. */
+  z.object({
+    tool: z.literal('send_followup'),
+    arguments: SendFollowupInput.extend({ body: UpdateDraftInput.shape.body.optional() }),
+    sessionId: SessionId,
+  }),
+  z.object({ tool: z.literal('discard_draft'), arguments: DiscardDraftInput, sessionId: SessionId }),
+  /** "Mark renewed" and similar buttons. */
+  z.object({ tool: z.literal('mark_done'), arguments: MarkDoneInput, sessionId: SessionId }),
 ]);
 export type AgentActionInput = z.infer<typeof AgentActionInput>;
 
@@ -333,6 +501,9 @@ export const AgentCard = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('source'), result: GetSourceResult, item: ObligationSchema.nullable() }),
   z.object({ kind: z.literal('ingest'), result: IngestResult }),
   z.object({ kind: z.literal('choices'), heading: z.string(), candidates: z.array(Candidate) }),
+  z.object({ kind: z.literal('draft'), draft: FollowupDraft, item: ObligationSchema }),
+  z.object({ kind: z.literal('sent'), draft: FollowupDraft, item: ObligationSchema, delivery: SendFollowupResult.shape.delivery }),
+  z.object({ kind: z.literal('renewal'), item: ObligationSchema, link: ActionLink }),
 ]);
 export type AgentCard = z.infer<typeof AgentCard>;
 

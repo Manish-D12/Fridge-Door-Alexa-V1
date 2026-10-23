@@ -73,9 +73,9 @@ export class DynamoObligationStore implements ObligationStore {
           TableName: this.table,
           Key: { householdId, id },
           UpdateExpression: 'SET #status = :done, doneBy = :by, doneAt = :at',
-          ConditionExpression: 'attribute_exists(id) AND #status = :pending',
+          ConditionExpression: 'attribute_exists(id) AND #status <> :done',
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':done': 'done', ':pending': 'pending', ':by': doneBy, ':at': doneAt },
+          ExpressionAttributeValues: { ':done': 'done', ':by': doneBy, ':at': doneAt },
           ReturnValues: 'ALL_NEW',
         }),
       );
