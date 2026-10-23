@@ -4,6 +4,8 @@ export interface Candidate {
   id: string;
   title: string;
   dueDate: string;
+  /** What tells it apart from the others: "for Maya", "from Bright Smiles". */
+  detail?: string;
 }
 
 /** An error whose message is safe to show to the end user (or speak aloud). */
@@ -23,9 +25,9 @@ export const notFound = (message: string) => new AppError('not_found', message);
 export const badRequest = (message: string, issues?: unknown[]) =>
   new AppError('bad_request', message, issues ? { issues } : {});
 
-export const ambiguous = (message: string, matches: Obligation[]) =>
+export const ambiguous = (message: string, matches: Obligation[], detail?: (o: Obligation) => string) =>
   new AppError('ambiguous', message, {
-    candidates: matches.map((o) => ({ id: o.id, title: o.title, dueDate: o.dueDate })),
+    candidates: matches.map((o) => ({ id: o.id, title: o.title, dueDate: o.dueDate, ...(detail ? { detail: detail(o) } : {}) })),
   });
 
 export const HTTP_STATUS: Record<ErrorCode, number> = {

@@ -66,10 +66,13 @@ export function Card({ card, tz, now, actions }: { card: AgentCard; tz: string; 
             {card.candidates.map((c) => (
               <button
                 key={c.id}
-                onClick={() => actions.say(`The ${c.title} due ${whenText(c.dueDate, tz, now).replace(' · ', ' at ')}`)}
-                className="flex items-center justify-between rounded-2xl bg-white/[0.06] px-5 py-4 text-left transition hover:bg-white/[0.12] active:scale-[0.99]"
+                onClick={() => actions.say(`The ${c.title}${c.detail ? ` ${c.detail}` : ''} due ${whenText(c.dueDate, tz, now).replace(' · ', ' at ')}`)}
+                className="flex items-center justify-between gap-4 rounded-2xl bg-white/[0.06] px-5 py-4 text-left transition hover:bg-white/[0.12] active:scale-[0.99]"
               >
-                <span className="text-[22px] font-medium">{c.title}</span>
+                <span className="min-w-0">
+                  <span className="block truncate text-[22px] font-medium">{c.title}</span>
+                  {c.detail && <span className="block truncate text-[16px] text-white/55">{c.detail}</span>}
+                </span>
                 <span className="text-[19px] text-alexa">{whenText(c.dueDate, tz, now)}</span>
               </button>
             ))}

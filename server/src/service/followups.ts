@@ -135,7 +135,8 @@ export class FollowUps {
 
   async draft(ctx: RequestContext, input: DraftFollowupInput): Promise<DraftFollowupResult> {
     const member = requireMember(ctx, 'write an email');
-    const item = await this.opts.service.resolve(ctx, input.idOrTitle);
+    // Several dentists? The day or sender they mentioned decides, then the one with an email to reply to.
+    const item = await this.opts.service.resolve(ctx, input.idOrTitle, { hints: { when: input.when, from: input.from }, preferEmail: true });
     const email = item.email;
     if (!email) {
       return {
@@ -249,7 +250,8 @@ export class FollowUps {
   }
 
   async startRenewal(ctx: RequestContext, input: StartRenewalInput): Promise<StartRenewalResult> {
-    const item = await this.opts.service.resolve(ctx, input.idOrTitle);
+    // Links come from emails, so among equal matches the one read from an email is the useful one.
+    const item = await this.opts.service.resolve(ctx, input.idOrTitle, { hints: { when: input.when, from: input.from }, preferEmail: true });
     const link = pickLink(item.links);
     if (!link) {
       const canAsk = item.email && !isNoReply(item.email.fromAddress);

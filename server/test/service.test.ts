@@ -4,7 +4,8 @@ import { Extractor } from '../src/extract/extractor.js';
 import { AppError } from '../src/lib/errors.js';
 import { ObligationService, type RequestContext } from '../src/service/obligations.js';
 import type { LocalJsonStore } from '../src/store/local.js';
-import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, raw, TZ, tempStore } from './helpers.js';
+import type { Obligation } from '@fridge-door/shared';
+import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, ob, raw, TZ, tempStore } from './helpers.js';
 
 const priya: RequestContext = { householdId: HOUSEHOLD, userId: 'priya' };
 const dan: RequestContext = { householdId: HOUSEHOLD, userId: 'Dan' };
@@ -164,7 +165,77 @@ describe('mark_done', () => {
     await service.add(anon, { type: 'bill', title: 'Water bill', dueDate: '2026-10-28', sourceSnippet: 'second water bill' });
     const err = await rejectsWith(service.markDone(anon, { idOrTitle: 'water bill', doneBy: 'Dan' }), 'ambiguous');
     assert.equal(err.extra.candidates?.length, 2);
-    assert.match(err.message, /Which one did you mean\?$/);
+    assert.equal(err.message, 'Do you mean the one tomorrow or the October 28 one?');
+    assert.deepEqual(err.extra.candidates?.map((c) => c.detail), ['from a spoken request', 'from a spoken request']);
+  });
+});
+
+describe('matching several items with the same name', () => {
+  const ctx = { householdId: HOUSEHOLD, userId: 'Priya' };
+  const gmailFrom = (name: string, address: string) => ({
+    gmailMessageId: `m-${address}`,
+    threadId: `t-${address}`,
+    messageIdHeader: null,
+    references: null,
+    fromAddress: address,
+    fromName: name,
+    subject: 'Appointment',
+    demo: false,
+  });
+  // Mon Oct 26 (WhatsApp, for Maya) and Tue Oct 27 (from the dentist's email).
+  const MONDAY = ob({ id: 'mon', type: 'appointment', title: 'Dentist appointment', forWhom: 'Maya', source: 'whatsapp', dueDate: '2026-10-26T22:30:00.000Z' });
+  const TUESDAY = ob({
+    id: 'tue',
+    type: 'appointment',
+    title: 'Dentist cleaning appointment',
+    source: 'gmail',
+    dueDate: '2026-10-27T22:30:00.000Z',
+    email: gmailFrom('money no money', 'moneynomoney15@gmail.com'),
+  });
+
+  async function setup(items: Obligation[]) {
+    const { store, cleanup } = await tempStore();
+    after(cleanup);
+    for (const o of items) await store.put(o);
+    return new ObligationService(store, { timeZone: TZ, defaultCurrency: 'USD', now: () => NOW });
+  }
+
+  it('does not let an exact title win over another item with all the same words', async () => {
+    const s = await setup([MONDAY, TUESDAY]);
+    const err = await rejectsWith(s.resolve(ctx, 'dentist appointment'), 'ambiguous');
+    assert.equal(err.message, 'Do you mean the Monday one for Maya or the Tuesday one from money no money?');
+    assert.deepEqual(err.extra.candidates?.map((c) => [c.id, c.detail]), [['mon', 'for Maya'], ['tue', 'from money no money']]);
+  });
+
+  it('uses the day, date or sender the person mentions', async () => {
+    const s = await setup([MONDAY, TUESDAY]);
+    assert.equal((await s.resolve(ctx, 'dentist appointment', { hints: { when: 'Tuesday' } })).id, 'tue');
+    assert.equal((await s.resolve(ctx, 'dentist', { hints: { when: 'monday' } })).id, 'mon');
+    assert.equal((await s.resolve(ctx, 'the dentist on Tuesday')).id, 'tue', 'hints inside the words count too');
+    assert.equal((await s.resolve(ctx, 'dentist appointment on Oct 27 at 3:30 PM')).id, 'tue');
+    assert.equal((await s.resolve(ctx, 'dentist', { hints: { when: '2026-10-26' } })).id, 'mon');
+    assert.equal((await s.resolve(ctx, 'dentist', { hints: { from: 'money no money' } })).id, 'tue');
+    assert.equal((await s.resolve(ctx, 'dentist from WhatsApp')).id, 'mon');
+    assert.equal((await s.resolve(ctx, 'dentist', { hints: { from: 'the email' } })).id, 'tue');
+  });
+
+  it('asks instead of guessing when the day fits none of them', async () => {
+    const s = await setup([MONDAY, TUESDAY]);
+    await rejectsWith(s.resolve(ctx, 'dentist appointment', { hints: { when: 'Friday' } }), 'ambiguous');
+  });
+
+  it('prefers the one with an email to reply to, when asked', async () => {
+    const s = await setup([MONDAY, TUESDAY]);
+    assert.equal((await s.resolve(ctx, 'dentist appointment', { preferEmail: true })).id, 'tue');
+    const both = await setup([MONDAY, { ...TUESDAY, id: 'tue2', email: gmailFrom('Bright Smiles', 'dr@bs.com') }, TUESDAY]);
+    const err = await rejectsWith(both.resolve(ctx, 'dentist', { preferEmail: true }), 'ambiguous');
+    assert.equal(err.message, 'Do you mean the Tuesday one from Bright Smiles or the Tuesday one from money no money?');
+  });
+
+  it('still settles on a single item by title alone', async () => {
+    const s = await setup([MONDAY, TUESDAY, ob({ id: 'vet', type: 'appointment', title: 'Vet checkup', dueDate: '2026-10-26T22:30:00.000Z' })]);
+    assert.equal((await s.resolve(ctx, 'vet')).id, 'vet');
+    assert.equal((await s.resolve(ctx, 'cleaning')).id, 'tue');
   });
 });
 

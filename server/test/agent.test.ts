@@ -279,6 +279,44 @@ describe('agent (MCP client)', () => {
     if (done.card?.kind === 'item') assert.equal(done.card.item.status, 'done');
   });
 
+  it('drafts for the dentist the person means, and asks with a choice card when it cannot tell', async () => {
+    // Saturday's fixture dentist is for Maya (no email); this one came from the dentist's own email.
+    await store.put(
+      ob({
+        id: 'dentist-tue',
+        type: 'appointment',
+        title: 'Dentist cleaning appointment',
+        dueDate: '2026-10-27T22:30:00.000Z',
+        source: 'gmail',
+        sourceSnippet: 'Your cleaning is booked for Tuesday, October 27 at 3:30 PM.',
+        email: { gmailMessageId: 'd2', threadId: 'thread-d2', messageIdHeader: null, references: null, fromAddress: 'moneynomoney15@gmail.com', fromName: 'money no money', subject: 'Dentist appointment confirmation', demo: false },
+      }),
+    );
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('draft_followup', { idOrTitle: 'dentist appointment', intent: 'reschedule', when: 'Tuesday', details: 'ask if Thursday works' })] },
+      { text: "Here's a draft asking to move it. Should I send it?", toolCalls: [] },
+    ]);
+    const r = await post('/chat', { message: "I can't make the dentist on Tuesday, ask if Thursday works" });
+    assert.equal(r.card?.kind, 'draft');
+    if (r.card?.kind === 'draft') {
+      assert.equal(r.card.item.id, 'dentist-tue');
+      assert.equal(r.card.draft.to, 'moneynomoney15@gmail.com');
+    }
+
+    model = new ScriptedChat([
+      { text: '', toolCalls: [call('who_handled', { idOrTitle: 'dentist appointment' })] },
+      { text: 'Do you mean the Saturday one for Maya or the Tuesday one from money no money?', toolCalls: [] },
+    ]);
+    const ask = await post('/chat', { message: 'Did anyone handle the dentist appointment?' });
+    assert.equal(ask.card?.kind, 'choices');
+    if (ask.card?.kind === 'choices') {
+      assert.deepEqual(ask.card.candidates.map((c) => [c.id, c.detail]), [['dentist', 'for Maya'], ['dentist-tue', 'from money no money']]);
+    }
+    const toolTurn = model.chatRequests[1]!.messages.at(-1)!;
+    assert.equal(toolTurn.role, 'tool');
+    if (toolTurn.role === 'tool') assert.equal((toolTurn.results[0]!.content as { error: string }).error, 'Do you mean the Saturday one for Maya or the Tuesday one from money no money?');
+  });
+
   it('only counts a clear go-ahead as approval', () => {
     for (const yes of ['Yes', 'send it', 'Yep, go ahead', 'OK send', 'sounds good']) assert.equal(soundsLikeApproval(yes), true, yes);
     for (const no of ["No, don't send it", 'wait', 'Yes but change it to Friday', 'not yet', 'what does it say?', 'cancel it']) {

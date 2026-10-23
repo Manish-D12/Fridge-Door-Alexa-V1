@@ -31,11 +31,13 @@ export interface Mailbox {
 }
 
 /**
- * Recent emails that may hold an obligation. Gmail's {a b} means "a OR b" and
- * it doesn't stem, so plurals are listed too. Promotions and social are skipped.
+ * Recent emails that may hold an obligation, in every category (a bill can land
+ * in Promotions, a booking in Social) and from any sender; only spam, trash,
+ * chats and drafts are left out. Gmail's {a b} means "a OR b" and it doesn't
+ * stem, so plurals are listed too. Marketing is ruled out later, by keywords.
  */
 export const GMAIL_QUERY =
-  'newer_than:14d -category:promotions -category:social -in:chats -in:sent ' +
+  'newer_than:14d -in:spam -in:trash -in:chats -in:drafts ' +
   '{bill bills invoice invoices due appointment appointments booking bookings confirmation order orders delivery deliveries renewal reminder school}';
 
 /** Long bodies are mostly footers; this keeps model input (and cost) bounded. */
@@ -50,7 +52,7 @@ export function emailDocument(m: MailMessage): string {
 // Keyword pre-filter: decides, without the model, whether an email is worth a model call.
 // ---------------------------------------------------------------------------
 
-const SKIP_LABELS = new Set(['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'SPAM', 'TRASH', 'SENT', 'DRAFT']);
+const SKIP_LABELS = new Set(['SPAM', 'TRASH', 'DRAFT', 'CHAT']);
 
 /** Account-security mail: never useful here, and not something to send to a model. */
 const SECURITY =
@@ -58,7 +60,9 @@ const SECURITY =
 
 /** Marketing words in a subject, unless it also names something to act on. */
 const PROMO_SUBJECT = /(\d+\s?% off|\bsale\b|\bdeals?\b|\bcoupons?\b|promo code|\bdiscount|limited time|\bnewsletter\b|\bwebinar\b)/i;
-const ACTIONABLE_SUBJECT = /\b(due|invoice|bill|appointment|booking|reservation|order\s*#?\d|shipped|delivery|renewal|expir)/i;
+const ACTIONABLE_SUBJECT = /\b(due|invoice|bill|statement|payment|appointment|booking|reservation|confirm(ed|ation)|tickets?|order\s*#?\d|shipped|delivery|renew|expir)/i;
+/** Gmail's bulk tabs: searched, but there only an actionable subject earns a model call. */
+const BULK_LABELS = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL'];
 
 const OBLIGATION_WORDS =
   /\b(bills?|invoices?|statements?|payments?|payable|due|balance|amount|appointments?|appt|bookings?|booked|reservations?|reserved|check-?in|confirm(ed|ation)?|orders?|ordered|ship(ped|ping|ment)|deliver(y|ies|ed|ing)?|arriv(e|es|ing)|renew(al|als|s)?|expir(e|es|ing|y|ation)|reminders?|school|class(room)?|teacher|field trip|permission slip|subscriptions?|tickets?|rsvp)\b/i;
@@ -80,14 +84,17 @@ const DATE_OR_MONEY = new RegExp(
   'i',
 );
 
-export type SkipReason = 'category' | 'security' | 'promotional' | 'no_keywords' | 'no_date_or_amount';
+export type SkipReason = 'spam_or_trash' | 'outgoing' | 'security' | 'promotional' | 'no_keywords' | 'no_date_or_amount';
 
 /** Why an email isn't worth a model call, or null if it is. */
 export function whyNotRelevant(m: MailMessage): SkipReason | null {
-  if (m.labels.some((l) => SKIP_LABELS.has(l))) return 'category';
+  if (m.labels.some((l) => SKIP_LABELS.has(l))) return 'spam_or_trash';
+  // Mail this account sent (our own follow-up replies among it), unless it also arrived, as a note to self does.
+  if (m.labels.includes('SENT') && !m.labels.includes('INBOX')) return 'outgoing';
   const head = `${m.subject}\n${m.text.slice(0, 1500)}`;
   if (SECURITY.test(head)) return 'security';
-  if (PROMO_SUBJECT.test(m.subject) && !ACTIONABLE_SUBJECT.test(m.subject)) return 'promotional';
+  const bulk = m.labels.some((l) => BULK_LABELS.includes(l));
+  if ((PROMO_SUBJECT.test(m.subject) || bulk) && !ACTIONABLE_SUBJECT.test(m.subject)) return 'promotional';
   const all = `${m.subject}\n${m.text}`;
   if (!OBLIGATION_WORDS.test(all)) return 'no_keywords';
   if (!DATE_OR_MONEY.test(all)) return 'no_date_or_amount';

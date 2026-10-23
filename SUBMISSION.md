@@ -98,7 +98,7 @@ demo it.
 | Email | Gmail API via `googleapis` |
 | Storage | DynamoDB |
 | Simulator | React 19, Vite and Tailwind 4, with the Web Speech API for voice in and out |
-| Tests | 108 server tests and 12 library tests on Node's built-in test runner, needing no network or API key. An end-to-end test drives every tool through the real SDK client over Streamable HTTP |
+| Tests | 116 server tests and 12 library tests on Node's built-in test runner, needing no network or API key. An end-to-end test drives every tool through the real SDK client over Streamable HTTP |
 
 ### Challenges we ran into
 
@@ -208,8 +208,8 @@ demo it.
 
 **What worked well**
 
-- `gmail.readonly` plus Gmail's search syntax (`newer_than:14d -category:promotions …`) did most of
-  the filtering on the server side before we fetched anything.
+- `gmail.readonly` plus Gmail's search syntax (`newer_than:14d -in:spam {bill invoice due …}`) narrowed
+  each sync to a few dozen candidates on Google's side before we fetched anything.
 - `users.getProfile` gives the connected address without asking for an extra scope.
 - Testing-mode OAuth clients let us run the whole consent flow locally against
   `http://localhost:3000/auth/google/callback`.

@@ -182,8 +182,12 @@ and careful with data.
   - A private item is invisible to everyone else. It acts like a missing item, even to `get_source`
     and duplicate checks.
 - **Least surprise.**
-  - "I paid the bill" is only marked done when exactly one item matches; otherwise Alexa asks which
-    one.
+  - "I paid the bill" is only marked done when exactly one item matches. An exact title doesn't beat
+    another title with the same words ("Dentist appointment" vs "Dentist cleaning appointment"). A day,
+    date or sender the person mentions narrows it down ("the dentist on Tuesday", "from Bright
+    Smiles"), and follow-ups prefer items that have an email to reply to. If it's still a tie, Alexa
+    asks "Do you mean the Monday one for Maya or the Tuesday one from Bright Smiles?" and the screen
+    shows one button per item.
   - Ingesting never edits existing items. Tests check this.
 
 The extraction pipeline is also published separately as a small MIT library:
@@ -200,7 +204,7 @@ The extraction pipeline is also published separately as a small MIT library:
 | Email | Gmail API and Google OAuth 2.0 via `googleapis`: read, plus send-only for replies a person approved |
 | Storage | Amazon DynamoDB (`@aws-sdk/lib-dynamodb`) or a local JSON file |
 | Simulator | React 19, Vite 8, Tailwind CSS 4, lucide-react, `qrcode` for renewal links, Web Speech API (recognition and `speechSynthesis`) |
-| Tests | Node's built-in test runner, with 108 server tests and 12 library tests. They need no network and no API key |
+| Tests | Node's built-in test runner, with 116 server tests and 12 library tests. They need no network and no API key |
 
 ## Setup and run
 
@@ -317,11 +321,11 @@ server/src
 | `ingest_image` | `base64`, `mimeType` | Checks the file signature, transcribes the photo, then extracts from the transcript like `ingest_text` |
 | `confirm_item` | `id`, `chosenDate` | Settles an item that ingest flagged with `needsConfirmation` (e.g. "10/11") |
 | `sync_inbox` | none | Reads up to 5 new emails from the connected Gmail into the list, and checks threads waiting on a reply (see "Gmail sync") |
-| `draft_followup` | `idOrTitle`, `intent`: reschedule \| cancel \| request_extension \| confirm \| ask_question, `details?` | Drafts a reply to the item's source email. Returns `draft` (id, to, subject "Re: …", body, expiry) or `draft: null` with a `reason` when there is nobody to write to |
+| `draft_followup` | `idOrTitle`, `intent`: reschedule \| cancel \| request_extension \| confirm \| ask_question, `details?`, `when?`, `from?` | Drafts a reply to the item's source email. Returns `draft` (id, to, subject "Re: …", body, expiry) or `draft: null` with a `reason` when there is nobody to write to |
 | `send_followup` | `draftId`, `confirmedBy` | Sends the draft in its thread (In-Reply-To and References set), logs it in the item's `actions`, and sets `awaiting_reply` for reschedule and cancel |
 | `discard_draft` | `draftId` | Cancels a draft |
 | `update_draft` | `draftId`, `body` | Replaces a draft's body with the person's edit (screens only) |
-| `start_renewal` | `idOrTitle` | Returns the stored renewal, account or payment link and sets `renewal_in_progress`; `link: null` when the email had none |
+| `start_renewal` | `idOrTitle`, `when?`, `from?` | Returns the stored renewal, account or payment link and sets `renewal_in_progress`; `link: null` when the email had none |
 
 
 ### Extraction
@@ -476,7 +480,10 @@ The suite uses Node's built-in test runner and covers:
   per speaker, builds cards, and handles photo and date-confirmation buttons
 - an end-to-end run that starts the real Express app and calls every tool through the official SDK
   client over Streamable HTTP, then exercises the REST API
-- Gmail sync with a fake mailbox: MIME parsing, the keyword pre-filter, the per-sync limit, never
+- title matching with several items of the same name: day, date and sender hints, email preference,
+  and the "Monday one or Tuesday one" question
+- Gmail sync with a fake mailbox: MIME parsing, the keyword pre-filter, every category searched, quota
+  failures kept for retry, the per-sync limit, never
   sending an email to the model twice, partial failures, and the OAuth routes (state check, scopes)
 - follow-up actions with a fake model and mailer: the recipient can't be changed, sends need the same
   member within 30 minutes and happen once, edits are sent as shown, cancelled drafts stay unsent,
@@ -537,18 +544,25 @@ Settings (the gear, top right) → **Connect Gmail** opens `/auth/google` in a n
 stores the refresh token in `server/.data/gmail.json`. Then say *"Alexa, check my email"*: the agent
 calls the `sync_inbox` MCP tool, which does this:
 
-1. Searches Gmail for the last 14 days, skipping Promotions and Social, for bill, invoice, due,
-   appointment, booking, confirmation, order, delivery, renewal, reminder and school.
+1. Searches the last 14 days of **every category and every sender** (only spam, trash, chats and
+   drafts are left out) for bill, invoice, due, appointment, booking, confirmation, order, delivery,
+   renewal, reminder and school, up to 50 results.
 2. Skips ids an earlier sync already handled. They are stored in `gmail.json`.
 3. Rules out the rest with keyword checks, **without a model call**. An email needs an obligation
-   word and a date or amount. Security codes, sign-in alerts and marketing subjects are ruled out.
+   word and a date or amount. Security codes, sign-in alerts, marketing subjects and mail this
+   account sent (such as its own follow-up replies) are ruled out. In the Promotions and Social tabs
+   only an actionable subject (bill, due, invoice, appointment, booking, order #, delivery, renewal…)
+   earns a model call, so a bill filed under Promotions is still read but the ads are not.
 4. Sends at most 5 emails to the extractor, one at a time, as `Subject/From/Date` plus the
    plain-text body (`source: gmail`). Snippets are checked against that text as usual. The
    extraction cache means the same email content never reaches the model twice.
 
 So one sync costs at most 5 Gemini requests, or fewer when emails are cached or ruled out; the server
-log counts each request. If the model gives out part way, what was read is kept and the rest is
-retried next time. `npm run seed` forgets which emails were read but keeps the connection, so
+log counts each request. If the model is out of quota or overloaded, what was read is kept, the rest
+stay unprocessed and are retried next time, and Alexa says so: "I found 1 new email but couldn't
+read it right now. I'll retry later." Each sync logs the query and what happened to every matching
+email (`already handled`, `skipped: promotional`, `read`, `not read: model unavailable, will
+retry`), so "why didn't it see my email?" can be answered from the log. `npm run seed` forgets which emails were read but keeps the connection, so
 after a reset "check my email" finds them again, answered from the cache.
 
 To use your own client, create an OAuth client of type *Web application*, enable the Gmail API, add

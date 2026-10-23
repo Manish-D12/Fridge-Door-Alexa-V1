@@ -8,6 +8,7 @@ import type { gmail_v1 } from 'googleapis';
 import { MemoryExtractionCache } from '../src/extract/cache.js';
 import { Extractor } from '../src/extract/extractor.js';
 import {
+  GMAIL_QUERY,
   actionLinks,
   baseDomain,
   buildReply,
@@ -114,12 +115,26 @@ describe('whyNotRelevant', () => {
   });
 
   it('rules out the rest without a model call', () => {
-    assert.equal(whyNotRelevant(mail('Your bill', 'Due $5', ['CATEGORY_PROMOTIONS'])), 'category');
+    assert.equal(whyNotRelevant(mail('Your bill', 'Due $5', ['SPAM'])), 'spam_or_trash');
+    assert.equal(whyNotRelevant(mail('Your bill', 'Due $5', ['TRASH'])), 'spam_or_trash');
+    assert.equal(whyNotRelevant(mail('Re: Your appointment', 'Could we move it to Thursday, Oct 29?', ['SENT'])), 'outgoing', 'our own replies');
     assert.equal(whyNotRelevant(mail('Your verification code', 'Your code is 123456. It expires in 10 minutes. Order 12/3')), 'security');
     assert.equal(whyNotRelevant(mail('50% off everything this weekend', 'Order by Sunday, Oct 25')), 'promotional');
     assert.equal(whyNotRelevant(mail('Weekly newsletter', 'Our team news')), 'promotional');
     assert.equal(whyNotRelevant(mail('Lunch?', 'Want to grab lunch on Friday?')), 'no_keywords');
     assert.equal(whyNotRelevant(mail('Your order', 'Thanks for shopping with us!')), 'no_date_or_amount');
+  });
+
+  it('reads every category and any sender: only spam, trash and our own outgoing mail are skipped by label', () => {
+    assert.equal(whyNotRelevant(mail('Your bill', 'Due $5', ['CATEGORY_PROMOTIONS'])), null);
+    assert.equal(whyNotRelevant(mail('Booking confirmed', 'See you Oct 30', ['CATEGORY_SOCIAL'])), null);
+    // In the bulk tabs, marketing needs an actionable subject to cost a model call.
+    assert.equal(whyNotRelevant(mail('Hi Shopper, one last reminder from Crocs', 'Order by Oct 30 for $20 off', ['CATEGORY_PROMOTIONS'])), 'promotional');
+    assert.equal(whyNotRelevant(mail('The MAX Online scheduler is open', 'Book sessions from Oct 28', ['CATEGORY_PROMOTIONS'])), 'promotional');
+    assert.equal(whyNotRelevant(mail('Dentist appointment confirmation', 'Booked for Tuesday, October 27 at 3:30 PM', ['CATEGORY_PERSONAL', 'INBOX'])), null);
+    assert.equal(whyNotRelevant(mail('Note to self: bill', 'Due Oct 30', ['SENT', 'INBOX'])), null, 'sent to yourself still arrives');
+    assert.match(GMAIL_QUERY, /^newer_than:14d -in:spam -in:trash -in:chats -in:drafts {/);
+    assert.doesNotMatch(GMAIL_QUERY, /category:|in:sent|from:/);
   });
 
   it('keeps an actionable subject even with a sale word in it', () => {
@@ -247,7 +262,7 @@ describe('GmailSync', async () => {
     const r = await sync.sync(ctx);
 
     assert.equal(provider.jsonRequests.length, 3, 'one model call per email read');
-    assert.deepEqual(r.emails, { matched: 6, alreadyRead: 0, notRelevant: 2, read: 3, remaining: 1 });
+    assert.deepEqual(r.emails, { matched: 6, alreadyRead: 0, notRelevant: 2, read: 3, failed: 0, remaining: 1 });
     assert.deepEqual(mailbox.fetched, ['code', 'water', 'promo', 'dentist', 'parcel'], 'stops fetching once the limit is reached');
     assert.deepEqual(r.items.map((o) => [o.title, o.source]), [['Water bill', 'gmail'], ['Dentist', 'gmail'], ['Parcel', 'gmail']]);
     assert.equal(r.items[0]!.sourceSnippet, WATER, 'snippets are verified against the email');
@@ -260,13 +275,13 @@ describe('GmailSync', async () => {
     const { sync, state, provider, mailbox } = await setup(inbox);
     await sync.sync(ctx);
     const second = await sync.sync(ctx);
-    assert.deepEqual(second.emails, { matched: 6, alreadyRead: 5, notRelevant: 0, read: 1, remaining: 0 });
+    assert.deepEqual(second.emails, { matched: 6, alreadyRead: 5, notRelevant: 0, read: 1, failed: 0, remaining: 0 });
     assert.deepEqual(second.items.map((o) => o.title), ['Library books']);
     assert.equal(provider.jsonRequests.length, 4);
     assert.equal(mailbox.fetched.filter((id) => id === 'water').length, 1, 'a handled email is not even fetched again');
 
     const third = await sync.sync(ctx);
-    assert.deepEqual(third.emails, { matched: 6, alreadyRead: 6, notRelevant: 0, read: 0, remaining: 0 });
+    assert.deepEqual(third.emails, { matched: 6, alreadyRead: 6, notRelevant: 0, read: 0, failed: 0, remaining: 0 });
     assert.equal(third.speech, 'No new emails about bills, orders or appointments since I last checked.');
 
     // What `npm run seed` does: forget handled ids. Same content, so the cache answers.
@@ -291,9 +306,10 @@ describe('GmailSync', async () => {
     provider.failOn = DENTIST;
     const r = await sync.sync(ctx);
     assert.equal(r.emails.read, 1);
-    assert.equal(r.emails.remaining, 3);
+    assert.equal(r.emails.failed, 2);
+    assert.equal(r.emails.remaining, 1);
     assert.deepEqual(r.items.map((o) => o.title), ['Water bill']);
-    assert.match(r.speech, /I'll read the rest next time/);
+    assert.match(r.speech, /I couldn't read 2 more right now; I'll retry later.$/);
     const { processed } = await state.read();
     assert.deepEqual(Object.keys(processed).sort(), ['code', 'promo', 'water']);
 
@@ -308,9 +324,24 @@ describe('GmailSync', async () => {
     assert.equal(r.speech, "I looked at 2 new emails, but none of them had a bill, order or appointment in them.");
     assert.equal(provider.jsonRequests.length, 0);
 
-    const failing = await setup(inbox);
-    failing.provider.failOn = WATER;
-    await assert.rejects(failing.sync.sync(ctx), (err: AppError) => err instanceof AppError && /couldn't read that just now/.test(err.message));
+  });
+
+  it('says it found an email it could not read (quota), and keeps it for the next sync', async () => {
+    const dentistOnly = [email('dentist', 'Dentist appointment confirmation', DENTIST, ['CATEGORY_PERSONAL', 'INBOX'])];
+    const { sync, provider, state, store } = await setup(dentistOnly);
+    provider.failOn = DENTIST; // 429 RESOURCE_EXHAUSTED
+    const r = await sync.sync(ctx);
+    assert.equal(r.speech, "I found 1 new email but couldn't read it right now. I'll retry later.");
+    assert.deepEqual(r.emails, { matched: 1, alreadyRead: 0, notRelevant: 0, read: 0, failed: 1, remaining: 0 });
+    assert.deepEqual(r.items, []);
+    assert.deepEqual((await state.read()).processed, {}, 'not marked processed');
+
+    provider.failOn = null; // quota back
+    const retry = await sync.sync(ctx);
+    assert.deepEqual(retry.items.map((o) => o.title), ['Dentist']);
+    assert.equal(retry.emails.alreadyRead, 0);
+    assert.equal((await store.list(HOUSEHOLD)).length, 1);
+    assert.ok((await state.read()).processed.dentist);
   });
 
   it('asks to connect first, and stores the token file with only what it needs', async () => {

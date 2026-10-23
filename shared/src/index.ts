@@ -211,8 +211,20 @@ export const ConfirmItemInput = z.object({
 });
 export type ConfirmItemInput = z.infer<typeof ConfirmItemInput>;
 
+/** Which item, when several share a title: what the person said about the existing item, not the change they want. */
+const ItemHints = {
+  when: z
+    .string()
+    .trim()
+    .max(50)
+    .optional()
+    .describe('The day or date of the EXISTING item if the person mentioned it, e.g. "Tuesday" in "I can’t make the dentist on Tuesday". Not the new time they want.'),
+  from: z.string().trim().max(100).optional().describe('Who the item came from, if the person said, e.g. "Bright Smiles" or "the email".'),
+};
+
 export const DraftFollowupInput = z.object({
   idOrTitle: z.string().trim().min(1).describe('The obligation id, or words from its title such as "dentist".'),
+  ...ItemHints,
   intent: FollowupIntent.describe(
     'What the email asks for: "reschedule", "cancel", "request_extension" (more time to pay or submit), "confirm" (yes, we will be there), or "ask_question".',
   ),
@@ -244,6 +256,7 @@ export type UpdateDraftInput = z.infer<typeof UpdateDraftInput>;
 
 export const StartRenewalInput = z.object({
   idOrTitle: z.string().trim().min(1).describe('The obligation id, or words from its title such as "car insurance".'),
+  ...ItemHints,
 });
 export type StartRenewalInput = z.infer<typeof StartRenewalInput>;
 
@@ -438,7 +451,8 @@ export const SyncInboxResult = IngestResult.extend({
     alreadyRead: z.number().int().describe('Skipped: read by an earlier sync.'),
     notRelevant: z.number().int().describe('Skipped by the keyword check, without calling the model.'),
     read: z.number().int().describe('Sent to extraction this time.'),
-    remaining: z.number().int().describe('Relevant but over the per-sync limit; the next sync reads them.'),
+    failed: z.number().int().describe('Relevant, but the model could not read them now (quota or overload). Kept unread; the next sync retries them.'),
+    remaining: z.number().int().describe('Not looked at yet: over the per-sync limit. The next sync reads them.'),
   }),
   replies: z
     .array(z.object({ id: z.string(), title: z.string(), from: z.string() }))
@@ -492,7 +506,13 @@ export const AgentActionInput = z.discriminatedUnion('tool', [
 ]);
 export type AgentActionInput = z.infer<typeof AgentActionInput>;
 
-const Candidate = z.object({ id: z.string(), title: z.string(), dueDate: IsoDateTime });
+const Candidate = z.object({
+  id: z.string(),
+  title: z.string(),
+  dueDate: IsoDateTime,
+  /** What tells it apart: "for Maya", "from Bright Smiles". */
+  detail: z.string().optional(),
+});
 
 /** Structured data for the screen, built from the last tool result of a turn. */
 export const AgentCard = z.discriminatedUnion('kind', [
@@ -528,7 +548,7 @@ export const ApiError = z.object({
   error: z.object({
     code: ErrorCode,
     message: z.string(),
-    candidates: z.array(z.object({ id: z.string(), title: z.string(), dueDate: IsoDateTime })).optional(),
+    candidates: z.array(z.object({ id: z.string(), title: z.string(), dueDate: IsoDateTime, detail: z.string().optional() })).optional(),
     issues: z.array(z.unknown()).optional(),
   }),
 });

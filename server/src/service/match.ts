@@ -1,5 +1,6 @@
-import type { Obligation } from '@fridge-door/shared';
+import type { Obligation, Source } from '@fridge-door/shared';
 import { ambiguous, notFound } from '../lib/errors.js';
+import { addLocalDays, localDateOf, localDayDiff, type LocalDate } from '../lib/time.js';
 
 /**
  * Resolves what a person said ("the water bill", "Maya's dentist") to a single
@@ -46,32 +47,181 @@ export function score(query: string, o: Obligation): number {
   return ratio >= 0.5 ? Math.round(ratio * 40) : 0;
 }
 
-export function resolveObligation(
-  items: Obligation[],
-  idOrTitle: string,
+/** Details a person may give to say which item they mean, besides its title. */
+export interface MatchHints {
+  /** A date or weekday of the item: "Tuesday", "Oct 27", "2026-10-27", "tomorrow". */
+  when?: string;
+  /** Who it came from: a sender's name or address, or "email", "WhatsApp", "photo". */
+  from?: string;
+}
+
+export interface ResolveOptions {
   /** On a tie, keep items that are still open, or ones already done. */
-  prefer: 'open' | 'done',
-  now: number,
-): Obligation {
+  prefer: 'open' | 'done';
+  now: number;
+  timeZone: string;
+  hints?: MatchHints;
+  /** On a tie, keep items read from an email: a follow-up can only reply to those. */
+  preferEmail?: boolean;
+}
+
+/** A title that contains every word the person said ("dentist") counts as fully matching. */
+const FULL_MATCH = 60;
+
+/**
+ * Picks the one item a person means. Every title that contains all their
+ * words is a candidate (an exact title doesn't beat "Dentist cleaning
+ * appointment" for "the dentist appointment"). A day, date or sender they
+ * mention, in `hints` or in the words themselves ("the dentist on Tuesday"),
+ * narrows the candidates; then email sources (if asked) and open/done status
+ * break ties. Anything still tied is asked about, naming what tells them apart.
+ */
+export function resolveObligation(items: Obligation[], idOrTitle: string, opts: ResolveOptions): Obligation {
   const trimmed = idOrTitle.trim();
   const byId = items.find((o) => o.id === trimmed);
   if (byId) return byId;
 
-  const scored = items.map((o) => ({ o, s: score(trimmed, o) })).filter((x) => x.s > 0);
+  const said = splitHints(trimmed);
+  const hints = { when: opts.hints?.when?.trim() || said.when, from: opts.hints?.from?.trim() || said.from };
+  const query = said.title || trimmed;
+  let scored = items.map((o) => ({ o, s: score(query, o) })).filter((x) => x.s > 0);
+  if (scored.length === 0 && query !== trimmed) scored = items.map((o) => ({ o, s: score(trimmed, o) })).filter((x) => x.s > 0);
   if (scored.length === 0) throw notFound(`I couldn't find anything matching "${trimmed}".`);
 
-  const best = Math.max(...scored.map((x) => x.s));
-  let top = scored.filter((x) => x.s === best).map((x) => x.o);
-  if (top.length > 1) {
-    const preferred = top.filter((o) => (o.status === 'done') === (prefer === 'done'));
-    if (preferred.length > 0) top = preferred;
+  const when = hints.when ? parseWhen(hints.when, opts.now, opts.timeZone) : null;
+  const hinted = when || hints.from;
+  let top: Obligation[];
+  const fitting = hinted ? scored.filter(({ o }) => (!when || onDay(o, when, opts.timeZone)) && (!hints.from || fromMatches(o, hints.from))) : scored;
+  if (fitting.length > 0) {
+    const best = Math.max(...fitting.map((x) => x.s));
+    top = fitting.filter((x) => x.s >= Math.min(best, FULL_MATCH)).map((x) => x.o);
+  } else {
+    // They named a day or sender that fits none of them: ask rather than pick by title alone.
+    top = scored.map((x) => x.o);
   }
+
+  if (fitting.length > 0 && top.length > 1 && opts.preferEmail) top = narrow(top, (o) => !!o.email);
+  if (fitting.length > 0 && top.length > 1) top = narrow(top, (o) => (o.status === 'done') === (opts.prefer === 'done'));
   if (top.length === 1) return top[0]!;
 
-  // Still tied: ask rather than guess, listing the ones closest to now first.
-  top.sort((a, b) => Math.abs(Date.parse(a.dueDate) - now) - Math.abs(Date.parse(b.dueDate) - now));
-  const names = top.slice(0, 3).map((o) => o.title);
-  throw ambiguous(`I found ${top.length} matches for "${trimmed}": ${joinSpoken(names)}. Which one did you mean?`, top);
+  // Still tied: ask, listing the ones closest to now first.
+  top.sort((a, b) => Math.abs(Date.parse(a.dueDate) - opts.now) - Math.abs(Date.parse(b.dueDate) - opts.now));
+  throw ambiguous(whichOne(top.slice(0, 3), opts.now, opts.timeZone), top, origin);
+}
+
+/** Keeps the items that pass, unless none do. */
+function narrow(items: Obligation[], keep: (o: Obligation) => boolean): Obligation[] {
+  const kept = items.filter(keep);
+  return kept.length > 0 ? kept : items;
+}
+
+const SOURCE_FROM: Record<Source, string> = { gmail: 'an email', whatsapp: 'a WhatsApp message', photo: 'a photo', manual: 'a spoken request' };
+
+/** "Do you mean the Monday one for Maya or the Tuesday one from Bright Smiles?" */
+function whichOne(items: Obligation[], now: number, timeZone: string): string {
+  const alike = items.every((o) => similarTitles(o.title, items[0]!.title));
+  const origins = new Set(items.map(origin));
+  const parts = items.map((o) => {
+    const day = dayWord(o.dueDate, now, timeZone);
+    const relative = ['today', 'tomorrow', 'yesterday'].includes(day);
+    if (!alike) return relative ? `${o.title} ${day}` : `${o.title} on ${day}`;
+    const one = relative ? `the one ${day}` : `the ${day} one`;
+    return origins.size > 1 ? `${one} ${origin(o)}` : one;
+  });
+  return `Do you mean ${joinSpoken(parts, 'or')}?`;
+}
+
+/** What tells same-titled items apart: "for Maya", "from Bright Smiles", "from a WhatsApp message". */
+function origin(o: Obligation): string {
+  if (o.forWhom) return `for ${o.forWhom}`;
+  if (o.email) return `from ${o.email.fromName ?? o.email.fromAddress}`;
+  return `from ${SOURCE_FROM[o.source]}`;
+}
+
+/** "today", "Monday" within a week either way, else "October 30". */
+export function dayWord(iso: string, now: number, timeZone: string): string {
+  const due = Date.parse(iso);
+  const diff = localDayDiff(now, due, timeZone);
+  if (diff === 0) return 'today';
+  if (diff === 1) return 'tomorrow';
+  if (diff === -1) return 'yesterday';
+  const opts: Intl.DateTimeFormatOptions = Math.abs(diff) < 7 ? { weekday: 'long' } : { month: 'long', day: 'numeric' };
+  return new Intl.DateTimeFormat('en-US', { timeZone, ...opts }).format(due);
+}
+
+// ---------------------------------------------------------------------------
+// Hints in what was said
+// ---------------------------------------------------------------------------
+
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+const WEEKDAY = /\b(monday|tuesday|tues|wednesday|weds|thursday|thurs|friday|saturday|sunday)\b/i;
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const MONTH = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const MONTH_DAY = new RegExp(`\\b${MONTH}\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, 'i');
+const DAY_MONTH = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b`, 'i');
+const ISO = /\b(\d{4})-(\d{2})-(\d{2})\b/;
+const RELATIVE = /\b(today|tonight|tomorrow)\b/i;
+const TIME = /\b(at\s+)?\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)/gi;
+const FROM = /\bfrom\s+(?:the\s+)?(.+?)(?=\s+(?:on|due|at|for|about)\b|[,.;]|$)/i;
+
+/** Pulls "on Tuesday", "Oct 27", "from Bright Smiles" out of a request, leaving the title words. */
+export function splitHints(text: string): { title: string; when?: string; from?: string } {
+  let rest = text;
+  let from: string | undefined;
+  const f = FROM.exec(rest);
+  if (f) {
+    from = f[1]!.trim();
+    rest = rest.replace(f[0], ' ');
+  }
+  let when: string | undefined;
+  for (const re of [ISO, MONTH_DAY, DAY_MONTH, WEEKDAY, RELATIVE]) {
+    const m = re.exec(rest);
+    if (m) {
+      when ??= m[0];
+      rest = rest.replace(m[0], ' ');
+    }
+  }
+  rest = rest
+    .replace(TIME, ' ')
+    .replace(/\b(on|due|this|next|coming|at)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return { title: rest, ...(when ? { when } : {}), ...(from ? { from } : {}) };
+}
+
+type When = { kind: 'weekday'; weekday: number } | { kind: 'date'; month: number; day: number; year?: number };
+
+function parseWhen(text: string, now: number, timeZone: string): When | null {
+  const t = text.trim().toLowerCase();
+  const iso = ISO.exec(t);
+  if (iso) return { kind: 'date', year: Number(iso[1]), month: Number(iso[2]), day: Number(iso[3]) };
+  const rel = RELATIVE.exec(t);
+  if (rel) {
+    const d = addLocalDays(localDateOf(now, timeZone), rel[1] === 'tomorrow' ? 1 : 0);
+    return { kind: 'date', ...d };
+  }
+  const md = MONTH_DAY.exec(t);
+  if (md) return { kind: 'date', month: MONTHS.indexOf(md[1]!.slice(0, 3)) + 1, day: Number(md[2]) };
+  const dm = DAY_MONTH.exec(t);
+  if (dm) return { kind: 'date', month: MONTHS.indexOf(dm[2]!.slice(0, 3)) + 1, day: Number(dm[1]) };
+  const wd = WEEKDAY.exec(t);
+  if (wd) return { kind: 'weekday', weekday: WEEKDAYS.findIndex((w) => w.startsWith(wd[1]!.toLowerCase().slice(0, 3))) };
+  return null;
+}
+
+function onDay(o: Obligation, when: When, timeZone: string): boolean {
+  const d: LocalDate = localDateOf(Date.parse(o.dueDate), timeZone);
+  if (when.kind === 'weekday') return new Date(Date.UTC(d.year, d.month - 1, d.day)).getUTCDay() === when.weekday;
+  return d.month === when.month && d.day === when.day && (when.year === undefined || d.year === when.year);
+}
+
+const SOURCE_WORDS: Record<Source, string> = { gmail: 'email gmail mail', whatsapp: 'whatsapp message chat', photo: 'photo picture notice', manual: '' };
+
+function fromMatches(o: Obligation, from: string): boolean {
+  const wanted = tokens(from).filter((t) => !['email', 'mail', 'message'].includes(t) || tokens(from).length === 1);
+  if (wanted.length === 0) return true;
+  const have = tokens(`${o.email?.fromName ?? ''} ${o.email?.fromAddress.replace(/[@.]/g, ' ') ?? ''} ${SOURCE_WORDS[o.source]}`);
+  return wanted.every((w) => have.some((h) => tokenMatches(w, h)));
 }
 
 /** "a, b, or c". Pass sep "; " when the parts themselves contain commas. */

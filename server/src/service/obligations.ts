@@ -43,7 +43,7 @@ import {
   startOfLocalDay,
 } from '../lib/time.js';
 import type { ObligationStore } from '../store/types.js';
-import { joinSpoken, normalize, resolveObligation, similarTitles } from './match.js';
+import { joinSpoken, normalize, resolveObligation, similarTitles, type ResolveOptions } from './match.js';
 
 /** Who is asking. Derived from the transport (headers), never from tool arguments. */
 export interface RequestContext {
@@ -252,7 +252,7 @@ export class ObligationService {
 
   async markDone(ctx: RequestContext, input: MarkDoneInput): Promise<MarkDoneResult> {
     const now = this.now();
-    const target = resolveObligation(await this.visible(ctx), input.idOrTitle, 'open', now);
+    const target = resolveObligation(await this.visible(ctx), input.idOrTitle, { prefer: 'open', now, timeZone: this.opts.timeZone });
     const doneBy = input.doneBy.trim();
 
     if (target.status === 'done') {
@@ -276,7 +276,7 @@ export class ObligationService {
 
   async whoHandled(ctx: RequestContext, input: WhoHandledInput): Promise<WhoHandledResult> {
     const now = this.now();
-    const item = resolveObligation(await this.visible(ctx), input.idOrTitle, 'done', now);
+    const item = resolveObligation(await this.visible(ctx), input.idOrTitle, { prefer: 'done', now, timeZone: this.opts.timeZone });
     const handled = item.status === 'done';
     const speech = handled
       ? `${item.doneBy ?? 'Someone'} handled ${item.title} ${spokenWhen(item.doneAt ?? item.dueDate, now, this.opts.timeZone)}.`
@@ -321,26 +321,28 @@ export class ObligationService {
   /**
    * Several emails at once (an inbox sync), answered with one result. Each is
    * extracted on its own, so snippets quote that email and the cache works per
-   * email. `onSaved(i)` runs once email i is saved. If the model fails part way,
-   * what was saved stays and `read` says how many got through; a failure on
-   * the first email is thrown.
+   * email. `onSaved(i)` runs once email i is saved. If the model fails (quota,
+   * overload), reading stops: what was saved stays, `read` says how many got
+   * through and `error` says why, so the caller can keep the rest for later.
    */
   async ingestEmails(
     ctx: RequestContext,
     emails: IncomingEmail[],
     onSaved: (index: number) => Promise<void> = async () => undefined,
-  ): Promise<{ result: IngestResult; read: number }> {
+  ): Promise<{ result: IngestResult; read: number; error: AppError | null }> {
     const extractor = this.requireExtractor();
     const now = this.now();
     const meta: IngestMeta = { kind: 'text', source: 'gmail', transcript: null, now, subject: emails.length === 1 ? 'that email' : 'those emails' };
     const all: Saved = { added: [], duplicates: [], skipped: [] };
     let read = 0;
+    let error: AppError | null = null;
     for (const [i, { text, email, links }] of emails.entries()) {
       let extracted: ExtractionResult;
       try {
         extracted = await reading(() => extractor.extract(text, { sourceDescription: SOURCE_PHRASE.gmail, now }));
       } catch (err) {
-        if (read === 0) throw err;
+        // reading() turns every model failure into an AppError.
+        error = err as AppError;
         break;
       }
       const saved = await this.saveExtracted(ctx, extracted, meta, { email, links });
@@ -350,7 +352,7 @@ export class ObligationService {
       read++;
       await onSaved(i);
     }
-    return { result: this.ingestResult(all, meta), read };
+    return { result: this.ingestResult(all, meta), read, error };
   }
 
   /** Transcribes the photo first, so every sourceSnippet quotes real text from it. */
@@ -387,9 +389,9 @@ export class ObligationService {
     };
   }
 
-  /** One visible obligation by id or title words; ties are asked about, not guessed. */
-  async resolve(ctx: RequestContext, idOrTitle: string, prefer: 'open' | 'done' = 'open'): Promise<Obligation> {
-    return resolveObligation(await this.visible(ctx), idOrTitle, prefer, this.now());
+  /** One visible obligation by id or title words (plus any day or sender hints); ties are asked about, not guessed. */
+  async resolve(ctx: RequestContext, idOrTitle: string, opts: Partial<Pick<ResolveOptions, 'prefer' | 'hints' | 'preferEmail'>> = {}): Promise<Obligation> {
+    return resolveObligation(await this.visible(ctx), idOrTitle, { prefer: 'open', ...opts, now: this.now(), timeZone: this.opts.timeZone });
   }
 
   /** Appends to the item's action history and optionally moves its status. Returns the saved item. */

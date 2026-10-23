@@ -14,7 +14,7 @@ export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
 const RECONNECT_FOR_REPLIES = 'Reconnect Gmail to enable replies: open settings on the screen and tap Reconnect.';
 
 /** How many matching ids to look through per sync; only `maxEmails` of them reach the model. */
-const SEARCH_LIMIT = 25;
+const SEARCH_LIMIT = 50;
 
 export interface GoogleOAuthConfig {
   clientId: string;
@@ -134,50 +134,58 @@ export class GmailSync implements Mailer {
     const fresh = ids.filter((id) => !state.processed[id]);
     const toRead: ({ id: string } & IncomingEmail)[] = [];
     const ruledOut: string[] = [];
+    // One line per sync saying what happened to each matching email, for "why didn't it see my email?".
+    const decisions: Record<string, string> = {};
+    for (const id of ids) if (state.processed[id]) decisions[id] = `already handled ${state.processed[id]}`;
     let looked = 0;
     for (const id of fresh) {
       if (toRead.length >= this.opts.maxEmails) break;
       const message = await this.gmail(() => mailbox.get(id));
       looked++;
       const reason = whyNotRelevant(message);
-      if (reason) {
-        ruledOut.push(id);
-        this.opts.logger.debug('gmail: email skipped without a model call', { reason });
-      } else {
-        toRead.push({ id, text: emailDocument(message), email: emailRef(message), links: actionLinks(message) });
-      }
+      decisions[id] = reason ? `skipped: ${reason}` : 'to read';
+      if (reason) ruledOut.push(id);
+      else toRead.push({ id, text: emailDocument(message), email: emailRef(message), links: actionLinks(message) });
     }
+    for (const id of fresh.slice(looked)) decisions[id] = 'over the per-sync limit';
     if (ruledOut.length > 0) await this.opts.state.markProcessed(ruledOut);
 
-    const { result, read } =
+    // Emails the model couldn't read stay unprocessed, so the next sync retries them.
+    const { result, read, error } =
       toRead.length > 0
         ? await this.opts.service.ingestEmails(ctx, toRead, async (i) => {
             await this.opts.state.markProcessed([toRead[i]!.id]);
           })
-        : { result: null, read: 0 };
+        : { result: null, read: 0, error: null };
+    for (const [i, e] of toRead.entries()) decisions[e.id] = i < read ? 'read' : 'not read: model unavailable, will retry';
     await this.opts.state.update((s) => {
       s.lastSyncAt = new Date(this.now()).toISOString();
     });
 
+    const failed = toRead.length - read;
     const emails = {
       matched: ids.length,
       alreadyRead: ids.length - fresh.length,
       notRelevant: ruledOut.length,
       read,
-      remaining: fresh.length - looked + (toRead.length - read),
+      failed,
+      remaining: fresh.length - looked,
     };
-    this.opts.logger.info('gmail sync', { ...emails, added: result?.items.length ?? 0, replies: replies.length });
+    this.opts.logger.info('gmail sync', { query: GMAIL_QUERY, ...emails, added: result?.items.length ?? 0, replies: replies.length, decisions });
+    if (error) this.opts.logger.warn('gmail sync: the model could not read some emails; they will be retried', { failed, err: error.cause ?? error.message });
 
     const plural = (n: number) => `${n} new email${n === 1 ? '' : 's'}`;
     let speech: string;
-    if (!result) {
+    if (read === 0 && failed > 0) {
+      speech = `I found ${plural(failed)} but couldn't read ${failed === 1 ? 'it' : 'them'} right now. I'll retry later.`;
+    } else if (!result) {
       speech =
         looked === 0
           ? 'No new emails about bills, orders or appointments since I last checked.'
           : `I looked at ${plural(looked)}, but none of them had a bill, order or appointment in them.`;
     } else {
       speech = `I read ${plural(read)}. ${result.speech}`;
-      if (read < toRead.length) speech += " The reading service is busy, so I'll read the rest next time.";
+      if (failed > 0) speech += ` I couldn't read ${failed} more right now; I'll retry later.`;
     }
     if (replies.length > 0) {
       const heard = replies.slice(0, 3).map((r) => `${r.from} replied about ${r.title}.`).join(' ');
