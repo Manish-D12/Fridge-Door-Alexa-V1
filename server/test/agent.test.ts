@@ -289,7 +289,7 @@ describe('agent (MCP client)', () => {
         dueDate: '2026-10-27T22:30:00.000Z',
         source: 'gmail',
         sourceSnippet: 'Your cleaning is booked for Tuesday, October 27 at 3:30 PM.',
-        email: { gmailMessageId: 'd2', threadId: 'thread-d2', messageIdHeader: null, references: null, fromAddress: 'moneynomoney15@gmail.com', fromName: 'money no money', subject: 'Dentist appointment confirmation', demo: false },
+        email: { gmailMessageId: 'd2', threadId: 'thread-d2', messageIdHeader: null, references: null, fromAddress: 'frontdesk@smilecare.example', fromName: 'SmileCare Dental', subject: 'Dentist appointment confirmation', demo: false },
       }),
     );
     model = new ScriptedChat([
@@ -300,21 +300,21 @@ describe('agent (MCP client)', () => {
     assert.equal(r.card?.kind, 'draft');
     if (r.card?.kind === 'draft') {
       assert.equal(r.card.item.id, 'dentist-tue');
-      assert.equal(r.card.draft.to, 'moneynomoney15@gmail.com');
+      assert.equal(r.card.draft.to, 'frontdesk@smilecare.example');
     }
 
     model = new ScriptedChat([
       { text: '', toolCalls: [call('who_handled', { idOrTitle: 'dentist appointment' })] },
-      { text: 'Do you mean the Saturday one for Maya or the Tuesday one from money no money?', toolCalls: [] },
+      { text: 'Do you mean the Saturday one for Maya or the Tuesday one from SmileCare Dental?', toolCalls: [] },
     ]);
     const ask = await post('/chat', { message: 'Did anyone handle the dentist appointment?' });
     assert.equal(ask.card?.kind, 'choices');
     if (ask.card?.kind === 'choices') {
-      assert.deepEqual(ask.card.candidates.map((c) => [c.id, c.detail]), [['dentist', 'for Maya'], ['dentist-tue', 'from money no money']]);
+      assert.deepEqual(ask.card.candidates.map((c) => [c.id, c.detail]), [['dentist', 'for Maya'], ['dentist-tue', 'from SmileCare Dental']]);
     }
     const toolTurn = model.chatRequests[1]!.messages.at(-1)!;
     assert.equal(toolTurn.role, 'tool');
-    if (toolTurn.role === 'tool') assert.equal((toolTurn.results[0]!.content as { error: string }).error, 'Do you mean the Saturday one for Maya or the Tuesday one from money no money?');
+    if (toolTurn.role === 'tool') assert.equal((toolTurn.results[0]!.content as { error: string }).error, 'Do you mean the Saturday one for Maya or the Tuesday one from SmileCare Dental?');
   });
 
   it('only counts a clear go-ahead as approval', () => {
