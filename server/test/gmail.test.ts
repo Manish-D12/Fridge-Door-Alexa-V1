@@ -35,7 +35,7 @@ import { FakeProvider, HOUSEHOLD, NOW, ob, raw, TZ, tempStore } from './helpers.
 const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
 
 /** A MailMessage with nothing in it; tests fill in what they need. */
-const BLANK: MailMessage = { id: '', threadId: 't', subject: '', from: '', date: '', labels: [], text: '', messageIdHeader: null, references: null, links: [] };
+const BLANK: MailMessage = { id: '', threadId: 't', subject: '', from: '', date: '', labels: [], text: '', messageIdHeader: null, references: null, links: [], receivedAt: 0 };
 
 describe('messageFromGmail', () => {
   it('takes the plain-text part, skipping attachments', () => {
@@ -75,6 +75,7 @@ describe('messageFromGmail', () => {
       messageIdHeader: '<bill-1@pge.com>',
       references: '<earlier@pge.com>',
       links: [],
+      receivedAt: 0,
     });
   });
 
@@ -172,7 +173,7 @@ class FakeMailbox implements Mailbox {
 
   async search(_query: string, max: number) {
     this.searches++;
-    return this.messages.slice(0, max).map((m) => m.id);
+    return this.messages.slice(0, max).map((m) => ({ id: m.id, threadId: m.threadId }));
   }
 
   async get(id: string) {
@@ -180,14 +181,15 @@ class FakeMailbox implements Mailbox {
     return this.messages.find((m) => m.id === id)!;
   }
 
-  /** threadId -> senders that replied, and the times asked about. */
-  readonly replies = new Map<string, string[]>();
-  readonly threadChecks: { threadId: string; afterMs: number; own: string }[] = [];
+  /** Extra thread contents (our sent messages, replies) beyond the searchable inbox. */
+  readonly threads = new Map<string, MailMessage[]>();
+  readonly threadChecks: string[] = [];
   readonly sent: { raw: string; threadId: string }[] = [];
 
-  async repliesInThread(threadId: string, afterMs: number, own: string) {
-    this.threadChecks.push({ threadId, afterMs, own });
-    return this.replies.get(threadId) ?? [];
+  async thread(threadId: string) {
+    this.threadChecks.push(threadId);
+    const all = [...this.messages.filter((m) => m.threadId === threadId), ...(this.threads.get(threadId) ?? [])];
+    return all.sort((a, b) => a.receivedAt - b.receivedAt);
   }
 
   async send(raw: string, threadId: string) {
@@ -578,33 +580,124 @@ describe('GmailSync and follow-ups', async () => {
     assert.match(Buffer.from(fresh.mailbox.sent[0]!.raw, 'base64url').toString(), /^To: renewals@harborline\.com\r\n/);
   });
 
-  it('notices a reply in the thread of an item waiting on one, without a model call', async () => {
-    const { sync, store, mailbox } = await setup(null);
-    const sentAt = new Date(NOW - 3_600_000).toISOString();
-    await store.put(
+  // The thread from the bug report: our reschedule request (sent without line
+  // breaks) and the dentist's "Yes", which quotes it.
+  const OURS =
+    'Hello,I would like to reschedule my dentist cleaning appointment for Wednesday, October 28th at 3:30 PM. ' +
+    'Would it be possible to move it to Thursday, October 29th at 4 PM instead?Thank you,Priya';
+  const YES =
+    'Yes, we can do that. Please be on time as im would be running late for\nanother appointment\n\n' +
+    'On Sat, 24 Oct 2026 at 02:04, Family <family@example.com>\nwrote:\n\n> Hello,I would like to reschedule my dentist cleaning appointment for\n' +
+    '> Wednesday, October 28th at 3:30 PM. Would it be possible to move it to\n> Thursday, October 29th at 4 PM instead?';
+  const SENT_AT = NOW - 30 * 60_000;
+
+  async function withFollowup(replyText: string | null, { clockSkewMs = 0, messageId = 'sent-1' as string | null } = {}) {
+    const t = await setup(null);
+    await t.store.put(
       ob({
         id: 'dentist',
         type: 'appointment',
-        title: 'Dentist appointment',
-        dueDate: '2026-10-24T22:30:00.000Z',
+        title: 'Dentist cleaning appointment',
+        dueDate: '2026-10-28T22:30:00.000Z', // Wed Oct 28, 3:30 PM
         source: 'gmail',
         status: 'awaiting_reply',
-        email: { gmailMessageId: 'd1', threadId: 'thread-d', messageIdHeader: null, references: null, fromAddress: 'dr.smile@brightsmiles.com', fromName: 'Bright Smiles', subject: 'Cleaning', demo: false },
-        actions: [{ type: 'email_sent', intent: 'reschedule', at: sentAt, by: 'Priya', summary: 'emailed Bright Smiles to move it', to: 'dr.smile@brightsmiles.com' }],
+        email: { gmailMessageId: 'appt', threadId: 'thread-d', messageIdHeader: null, references: null, fromAddress: 'dr.smile@brightsmiles.com', fromName: 'Dr. Okafor', subject: 'Dentist appointment confirmation', demo: false },
+        actions: [
+          {
+            type: 'email_sent',
+            intent: 'reschedule',
+            // Our clock, which may disagree with Gmail's.
+            at: new Date(SENT_AT + clockSkewMs).toISOString(),
+            by: 'Priya',
+            summary: 'emailed Dr. Okafor to move the cleaning to Thursday, October 29th at 4 PM',
+            to: 'dr.smile@brightsmiles.com',
+            note: null,
+            messageId,
+          },
+        ],
       }),
     );
-    mailbox.replies.set('thread-d', ['Dr. Okafor <dr.smile@brightsmiles.com>']);
-    const r = await sync.sync(ctx);
-    assert.deepEqual(mailbox.threadChecks, [{ threadId: 'thread-d', afterMs: Date.parse(sentAt), own: 'family@example.com' }]);
-    assert.deepEqual(r.replies, [{ id: 'dentist', title: 'Dentist appointment', from: 'Dr. Okafor' }]);
-    assert.match(r.speech, /^Dr\. Okafor replied about Dentist appointment\. I read 1 new email\./);
-    const item = (await store.get(HOUSEHOLD, 'dentist'))!;
-    assert.equal(item.status, 'pending');
-    assert.deepEqual(item.actions.at(-1), { type: 'reply_received', intent: null, at: new Date(NOW).toISOString(), by: 'Dr. Okafor', summary: 'replied', to: null });
+    const thread: MailMessage[] = [
+      { ...email('sent-1', 'Re: Dentist appointment confirmation', OURS, ['SENT']), threadId: 'thread-d', from: 'Family <family@example.com>', receivedAt: SENT_AT },
+    ];
+    t.mailbox.threads.set('thread-d', thread);
+    if (replyText !== null) {
+      // The reply also matches the search ("appointment", "confirmation"): it must not be read as a new item.
+      const reply = { ...email('reply-1', 'Re: Dentist appointment confirmation', replyText, ['INBOX']), threadId: 'thread-d', from: 'Dr. Okafor <dr.smile@brightsmiles.com>', receivedAt: SENT_AT + 31_000 };
+      (t.mailbox as unknown as { messages: MailMessage[] }).messages.unshift(reply);
+    }
+    return t;
+  }
 
-    mailbox.replies.clear();
+  it('applies a yes to the follow-up it answers: new date, the note kept, and never read as a new item', async () => {
+    const { sync, store, mailbox, service } = await withFollowup(YES);
+    const r = await sync.sync(ctx);
+
+    assert.deepEqual(r.replies, [
+      {
+        id: 'dentist',
+        title: 'Dentist cleaning appointment',
+        from: 'Dr. Okafor',
+        summary: 'agreed to move it to Thursday, October 29 at 4:00 PM',
+        note: 'Please be on time as im would be running late for another appointment',
+        updated: true,
+      },
+    ]);
+    assert.match(r.speech, /^Dr\. Okafor replied about Dentist cleaning appointment: they agreed to move it to Thursday, October 29 at 4:00 PM\. They added: "Please be on time as im would be running late for another appointment" I read 1 new email\./);
+    assert.deepEqual(r.items.map((o) => o.title), ['Car insurance'], 'only the unrelated email was extracted');
+    assert.deepEqual(mailbox.threadChecks, ['thread-d']);
+
+    const item = (await store.get(HOUSEHOLD, 'dentist'))!;
+    assert.equal(item.dueDate, '2026-10-29T23:00:00.000Z', 'Thu Oct 29, 4:00 PM');
+    assert.equal(item.status, 'pending');
+    assert.deepEqual(item.actions.at(-1), {
+      type: 'reply_received',
+      intent: 'reschedule',
+      at: new Date(SENT_AT + 31_000).toISOString(),
+      by: 'Dr. Okafor',
+      summary: 'agreed to move it to Thursday, October 29 at 4:00 PM',
+      to: null,
+      note: 'Please be on time as im would be running late for another appointment',
+      messageId: 'reply-1',
+    });
+
+    // Later syncs: the reply is handled, the follow-up answered, nothing re-read.
     const again = await sync.sync(ctx);
-    assert.deepEqual(again.replies, [], 'no longer waiting, so not checked again');
-    assert.equal(mailbox.threadChecks.length, 1);
+    assert.deepEqual(again.replies, []);
+    assert.equal(again.speech, 'No new emails about bills, orders or appointments since I last checked.');
+    assert.deepEqual(mailbox.threadChecks, ['thread-d'], 'no longer waiting, so not checked again');
+    const due = await service.whatsDue(ctx, { range: 'month' });
+    assert.ok(due.items.some((o) => o.id === 'dentist' && o.dueDate === '2026-10-29T23:00:00.000Z'));
+  });
+
+  it("matches by Gmail's own order, so a server clock running ahead doesn't hide the reply", async () => {
+    const ahead = await withFollowup(YES, { clockSkewMs: 5 * 60_000 });
+    assert.equal((await ahead.sync.sync(ctx)).replies.length, 1);
+    const noId = await withFollowup(YES, { clockSkewMs: 5 * 60_000, messageId: null });
+    assert.equal((await noId.sync.sync(ctx)).replies.length, 1, 'found by our SENT message near the send time');
+  });
+
+  it('records a no, or anything unclear, without changing the date', async () => {
+    const { sync, store } = await withFollowup("Sorry, we're fully booked on Thursday. Could you do Friday at 10?");
+    const r = await sync.sync(ctx);
+    assert.deepEqual(r.replies.map((x) => [x.summary, x.note, x.updated]), [[`said no: "Sorry, we're fully booked on Thursday"`, 'Could you do Friday at 10?', false]]);
+    const item = (await store.get(HOUSEHOLD, 'dentist'))!;
+    assert.equal(item.dueDate, '2026-10-28T22:30:00.000Z');
+    assert.equal(item.status, 'pending', 'answered, so no longer waiting');
+  });
+
+  it('keeps waiting while there is no reply, and checks again next time', async () => {
+    const { sync, store, mailbox } = await withFollowup(null);
+    assert.deepEqual((await sync.sync(ctx)).replies, []);
+    assert.equal((await store.get(HOUSEHOLD, 'dentist'))!.status, 'awaiting_reply');
+    await sync.sync(ctx);
+    assert.deepEqual(mailbox.threadChecks, ['thread-d', 'thread-d']);
+  });
+
+  it('applies a reply once, even when a sync and a status check run together', async () => {
+    const { sync, store } = await withFollowup(YES);
+    const [a, b] = await Promise.all([sync.sync(ctx), sync.refreshFollowups(ctx)]);
+    assert.equal(a.replies.length + b.length, 1);
+    assert.equal((await store.get(HOUSEHOLD, 'dentist'))!.actions.filter((x) => x.type === 'reply_received').length, 1);
   });
 });

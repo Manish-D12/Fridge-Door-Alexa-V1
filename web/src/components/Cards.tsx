@@ -377,6 +377,7 @@ function Timeline({ actions, now }: { actions: ObligationAction[]; now: number }
             <div className="text-[18px] leading-snug text-white/85">
               <b className="font-semibold text-white">{a.by}</b> {a.summary}
             </div>
+            {a.note && <div className="mt-1 rounded-xl bg-white/[0.06] px-3 py-2 text-[16px] italic leading-snug text-white/75">“{a.note}”</div>}
             <div className="text-[14px] text-white/45">{ago(a.at, now)}</div>
           </li>
         ))}

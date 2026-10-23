@@ -8,6 +8,9 @@ import type {
   DraftFollowupResult,
   FollowupDraft,
   FollowupIntent,
+  FollowupStatus,
+  GetFollowupStatusInput,
+  GetFollowupStatusResult,
   Obligation,
   SendFollowupInput,
   SendFollowupResult,
@@ -22,7 +25,7 @@ import { AppError, badRequest, notFound } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import { spokenWhen } from '../lib/time.js';
 import type { JsonSchema, LlmProvider } from '../llm/types.js';
-import { sameName, type ObligationService, type RequestContext } from './obligations.js';
+import { followupState, sameName, type ObligationService, type RequestContext } from './obligations.js';
 
 /**
  * Follow-up actions: turning an obligation into an email reply or a renewal
@@ -99,7 +102,8 @@ RULES
 1. Write only the body: a greeting, two to four short sentences, then a sign-off with the member's first name. No subject line, no markdown.
 2. Do what the intent says, using the person's own words for specifics. Never invent dates, times, reasons or facts. If they want to reschedule but gave no new time, ask which times are available.
 3. Refer to the appointment, bill or booking the way the original email does, with its date, so the reader knows which one you mean.
-4. gist: a short phrase, under 12 words, that completes "The email asks to ...", e.g. "move Maya's cleaning to Thursday afternoon".
+4. Lay it out like an email: the greeting on its own line, a blank line, the message, a blank line, then the sign-off and the name on their own lines.
+5. gist: a short phrase, under 12 words, that completes "The email asks to ...", e.g. "move Maya's cleaning to Thursday afternoon".
 Return JSON: {"body": "...", "gist": "..."}`;
 
 const RESPONSE_SCHEMA: JsonSchema = {
@@ -202,8 +206,16 @@ export class FollowUps {
     const mailer = draft.demo ? this.opts.outbox : this.opts.gmail;
     if (!mailer) throw new AppError('internal', "Gmail isn't set up on this server, so I can't send replies.");
     draft.state = 'sending';
+    let messageId: string;
     try {
-      await mailer.send({ to: draft.to, subject: draft.subject, body: draft.body, threadId: draft.threadId, inReplyTo: draft.inReplyTo, references: draft.references });
+      ({ messageId } = await mailer.send({
+        to: draft.to,
+        subject: draft.subject,
+        body: draft.body,
+        threadId: draft.threadId,
+        inReplyTo: draft.inReplyTo,
+        references: draft.references,
+      }));
     } catch (err) {
       draft.state = 'open';
       if (err instanceof AppError) throw err;
@@ -218,7 +230,7 @@ export class FollowUps {
     const saved = await this.opts.service.logAction(
       ctx,
       item.id,
-      { type: 'email_sent', intent: draft.intent, at: sentAt, by: member, summary: `emailed ${name} to ${draft.gist}`, to: draft.to },
+      { type: 'email_sent', intent: draft.intent, at: sentAt, by: member, summary: `emailed ${name} to ${draft.gist}`, to: draft.to, note: null, messageId },
       AWAITS_REPLY.has(draft.intent) ? 'awaiting_reply' : undefined,
     );
     this.opts.logger.info('follow-up sent', { intent: draft.intent, obligation: item.id, delivery: draft.demo ? 'demo_outbox' : 'gmail' });
@@ -270,7 +282,7 @@ export class FollowUps {
     const saved = await this.opts.service.logAction(
       ctx,
       item.id,
-      { type: 'renewal_started', intent: null, at: new Date(this.now()).toISOString(), by: ctx.userId ?? 'Someone', summary: `opened the renewal on ${host}`, to: null },
+      { type: 'renewal_started', intent: null, at: new Date(this.now()).toISOString(), by: ctx.userId ?? 'Someone', summary: `opened the renewal on ${host}`, to: null, note: null, messageId: null },
       'renewal_in_progress',
     );
     return {
@@ -278,6 +290,43 @@ export class FollowUps {
       item: saved,
       link,
     };
+  }
+
+  /**
+   * "Did the dentist reply?" From the item's history; callers check Gmail
+   * first (GmailSync.refreshFollowups) so a reply that just arrived counts.
+   */
+  async status(ctx: RequestContext, input: GetFollowupStatusInput): Promise<GetFollowupStatusResult> {
+    const now = this.now();
+    const items = input.idOrTitle
+      ? [await this.opts.service.resolve(ctx, input.idOrTitle, { hints: { when: input.when, from: input.from }, preferEmail: true, preferFollowup: true })]
+      : (await this.opts.service.list(ctx)).items
+          .filter((o) => followupState(o) !== 'none')
+          .sort((a, b) => Date.parse(b.actions.at(-1)!.at) - Date.parse(a.actions.at(-1)!.at))
+          .slice(0, 5);
+    const followups: FollowupStatus[] = items.map((item) => {
+      const state = followupState(item);
+      const sentAt = item.actions.findLastIndex((a) => a.type === 'email_sent');
+      const sent = sentAt >= 0 ? item.actions[sentAt]! : null;
+      const reply = state === 'replied' ? item.actions.slice(sentAt + 1).find((a) => a.type === 'reply_received')! : null;
+      return { item, state, sent, reply };
+    });
+
+    const who = (by: string) => (sameName(by, ctx.userId) ? 'You' : by);
+    const one = (f: FollowupStatus): string => {
+      if (f.state === 'replied') {
+        const note = f.reply!.note ? ` They added: "${f.reply!.note}"` : '';
+        return `${f.reply!.by} replied about ${f.item.title} ${ago(f.reply!.at, now)}: they ${f.reply!.summary}.${note}`;
+      }
+      if (f.state === 'waiting') return `${who(f.sent!.by)} ${f.sent!.summary} ${ago(f.sent!.at, now)}. No reply yet.`;
+      return `No follow-up email has been sent about ${f.item.title}${f.item.email ? '' : ', and it didn\'t come from an email'}.`;
+    };
+
+    let speech: string;
+    if (followups.length === 0) speech = 'No follow-up emails have been sent yet.';
+    else if (input.idOrTitle) speech = `${followups[0]!.state === 'replied' ? 'Yes. ' : followups[0]!.state === 'waiting' ? 'Not yet. ' : ''}${one(followups[0]!)}`;
+    else speech = followups.slice(0, 3).map(one).join(' ');
+    return { speech, followups };
   }
 
   // -------------------------------------------------------------------------
@@ -314,7 +363,7 @@ export class FollowUps {
 
     const parsed = ModelDraft.safeParse(raw);
     if (!parsed.success) throw new AppError('internal', "I couldn't write a good draft for that. Please try asking again.");
-    const body = parsed.data.body.replace(URL_OR_EMAIL, '').replace(/[*_#`]+/g, '').replace(/[ \t]+\n/g, '\n').trim();
+    const body = formatEmailBody(parsed.data.body.replace(URL_OR_EMAIL, '').replace(/[*_#`]+/g, ''));
     let gist = parsed.data.gist.replace(URL_OR_EMAIL, '').replace(/[\r\n]+/g, ' ').replace(/[.!?\s]+$/, '').trim();
     gist = gist.replace(/^(the email )?asks? to\b\s*/i, '');
     if (!gist || gist.split(/\s+/).length > 16) gist = FALLBACK_GIST[input.intent](item.title);
@@ -341,6 +390,35 @@ export class FollowUps {
     for (const [id, d] of this.drafts) if (Date.parse(d.expiresAt) + DRAFT_TTL_MS < now) this.drafts.delete(id);
     while (this.drafts.size >= MAX_DRAFTS) this.drafts.delete(this.drafts.keys().next().value!);
   }
+}
+
+const GREETING = /^((?:hi|hello|hey|dear|good (?:morning|afternoon|evening))\b[^,!\n]{0,60}[,!])\s*/i;
+const SIGN_OFF = /\s*\b((?:many )?thanks(?: again)?|thank you|best(?: regards| wishes)?|kind regards|warm regards|regards|sincerely|cheers)\s*([,!.]?)\s*([A-Z][\w.'-]*(?: [A-Z][\w.'-]*){0,2})?\s*$/i;
+
+/**
+ * Line breaks an email needs, when a model returns it as one line:
+ * "Hello,I would like ... instead?Thank you,Priya" becomes greeting, body and
+ * sign-off on their own lines, with the run-together sentences split.
+ */
+export function formatEmailBody(body: string): string {
+  let b = body.replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+  b = b.replace(/([a-z0-9)][.?!])([A-Z])/g, '$1 $2');
+  if (!b.includes('\n')) {
+    b = b.replace(GREETING, '$1\n\n');
+    b = b.replace(SIGN_OFF, (_m, words: string, punct: string, name?: string) => `\n\n${words}${punct || ','}${name ? `\n${name}` : ''}`);
+  }
+  return b.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** "just now", "12 minutes ago", "3 hours ago", "2 days ago". */
+function ago(iso: string, now: number): string {
+  const mins = Math.round((now - Date.parse(iso)) / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 function requireMember(ctx: RequestContext, what: string): string {

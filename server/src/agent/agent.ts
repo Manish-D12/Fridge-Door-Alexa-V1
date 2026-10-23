@@ -14,6 +14,7 @@ import {
   type IngestResult,
   type Obligation,
   type SendFollowupResult,
+  type GetFollowupStatusResult,
   type StartRenewalResult,
   type SyncInboxResult,
   type WhatsDueResult,
@@ -294,6 +295,7 @@ USING THE TOOLS
 - "What did the email / notice / message say", "where did that come from": always call get_source, which shows the original text on screen. It needs an id, so if you don't have one yet, call whats_due with range "month" first and pick the item by title and source (a school notice is usually a photo or an email). Then summarise the quote in one sentence.
 - "Check my email", "anything new in my inbox": sync_inbox. Say how many emails it read and what it found, using its speech.
 - "Did anyone ...", "who paid ...": who_handled.
+- "Did the dentist reply?", "any answer about the appointment?", "what did they say?": get_followup_status. It checks the email thread first; read its speech, which quotes the sender.
 - "Remind us ...": add_obligation, with the speaker's own words as sourceSnippet and the date resolved to YYYY-MM-DD.
 - "Ask the dentist to move it to Thursday", "email them to cancel", "ask for more time": draft_followup with the matching intent and their words as details. It only writes a draft, which appears on screen. Read its speech (the summary) aloud and wait.
 - Which item: if they say the day or sender of the existing item ("I can't make the dentist on Tuesday, ask if Thursday works"), pass it as when ("Tuesday") or from; the new time they want ("Thursday") goes in details, never in when. If a tool says several items match, ask its question word for word; the screen shows the choices.
@@ -344,6 +346,11 @@ export function cardFor(tool: string, out: ToolOutput, lookup: (id: string) => O
     case 'send_followup': {
       const r = d as unknown as SendFollowupResult;
       return { kind: 'sent', draft: r.draft, item: r.item, delivery: r.delivery };
+    }
+    case 'get_followup_status': {
+      // One item: its card, whose history shows the reply and their note.
+      const first = (d as unknown as GetFollowupStatusResult).followups[0];
+      return first ? { kind: 'item', heading: 'Follow-up', item: first.item } : null;
     }
     case 'start_renewal': {
       const r = d as unknown as StartRenewalResult;

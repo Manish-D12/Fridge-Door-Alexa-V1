@@ -118,6 +118,7 @@ flowchart LR
 | `draft_followup` | "Ask the dentist to move it to Thursday" | Writes a reply to the email the item came from (reschedule, cancel, request extension, confirm, ask a question). Sends nothing |
 | `send_followup` | "Yes, send it" | Sends that exact draft in the original thread, for the person who asked, within 30 minutes |
 | `discard_draft` | "No, don't send it" | Throws the draft away so it can't be sent |
+| `get_followup_status` | "Did the dentist reply?" | Checks the thread now, then says whether they answered, what they agreed to, and anything else they wrote |
 | `start_renewal` | "Renew the car insurance" | Shows the renewal or account link from the email as a QR code; never renews or pays itself |
 | `update_draft` | (editing on screen) | Saves the person's edit to a draft. Hidden from the model; used by the Send button |
 
@@ -204,7 +205,7 @@ The extraction pipeline is also published separately as a small MIT library:
 | Email | Gmail API and Google OAuth 2.0 via `googleapis`: read, plus send-only for replies a person approved |
 | Storage | Amazon DynamoDB (`@aws-sdk/lib-dynamodb`) or a local JSON file |
 | Simulator | React 19, Vite 8, Tailwind CSS 4, lucide-react, `qrcode` for renewal links, Web Speech API (recognition and `speechSynthesis`) |
-| Tests | Node's built-in test runner, with 116 server tests and 12 library tests. They need no network and no API key |
+| Tests | Node's built-in test runner, with 129 server tests and 12 library tests. They need no network and no API key |
 
 ## Setup and run
 
@@ -324,6 +325,7 @@ server/src
 | `draft_followup` | `idOrTitle`, `intent`: reschedule \| cancel \| request_extension \| confirm \| ask_question, `details?`, `when?`, `from?` | Drafts a reply to the item's source email. Returns `draft` (id, to, subject "Re: …", body, expiry) or `draft: null` with a `reason` when there is nobody to write to |
 | `send_followup` | `draftId`, `confirmedBy` | Sends the draft in its thread (In-Reply-To and References set), logs it in the item's `actions`, and sets `awaiting_reply` for reschedule and cancel |
 | `discard_draft` | `draftId` | Cancels a draft |
+| `get_followup_status` | `idOrTitle?`, `when?`, `from?` | Checks follow-up threads in Gmail, then returns each follow-up's `state` (none, waiting, replied), the email sent and the reply. Without `idOrTitle`, every recent follow-up |
 | `update_draft` | `draftId`, `body` | Replaces a draft's body with the person's edit (screens only) |
 | `start_renewal` | `idOrTitle`, `when?`, `from?` | Returns the stored renewal, account or payment link and sets `renewal_in_progress`; `link: null` when the email had none |
 
@@ -585,9 +587,19 @@ Obligations become actions, always with a person confirming:
    sets `awaiting_reply`. `whats_due` and `get_source` then say so: "Dentist appointment, on
    Monday at 3:30 PM (you emailed Bright Smiles Dental to move Maya's cleaning to Thursday afternoon,
    waiting for a reply)".
-4. **Watch.** The next "check my email" looks at those threads (metadata only, no model call). If the
-   sender answered, the item goes back to pending with "Bright Smiles Dental replied" in its history,
-   and Alexa says so.
+4. **Watch.** Every "check my email", and every "did they reply?" (`get_followup_status`), reads the
+   threads of follow-ups still waiting, **before** anything else in the inbox. The first message from
+   someone else after ours, by Gmail's own order rather than our clock, is the reply. It is read
+   without a model:
+   - A yes to a reschedule moves the item to the time **our** email proposed (the one date in it that
+     isn't the current one), e.g. "agreed to move it to Thursday, October 29 at 4:00 PM".
+   - A yes to a cancel closes the item. A no, or anything else, is recorded as said, and the date
+     stays.
+   - Anything else they wrote is kept verbatim as a note ("Please be on time"), on the item's history
+     and in what Alexa says.
+
+   Replies and anything else in a follow-up thread are conversation, so they are never sent to
+   extraction as new bills or appointments.
 
 *"Renew the car insurance"* calls `start_renewal`. It returns the renewal link stored from the email
 (links are collected at sync time: https only, on the sender's domain or a known payment site, named

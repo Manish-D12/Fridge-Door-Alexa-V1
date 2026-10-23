@@ -50,13 +50,13 @@ after(async () => {
 });
 
 describe('MCP over Streamable HTTP', () => {
-  it('negotiates the latest protocol version and lists all 15 tools with output schemas', async () => {
+  it('negotiates the latest protocol version and lists all 16 tools with output schemas', async () => {
     assert.equal(LATEST_PROTOCOL_VERSION, '2025-11-25');
     assert.equal(client.getServerVersion()?.name, 'fridge-door');
     assert.ok(client.getInstructions()?.includes('speech'));
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'add_obligation', 'confirm_item', 'discard_draft', 'draft_followup', 'get_source', 'ingest_image', 'ingest_text', 'mark_done', 'next_up',
+      'add_obligation', 'confirm_item', 'discard_draft', 'draft_followup', 'get_followup_status', 'get_source', 'ingest_image', 'ingest_text', 'mark_done', 'next_up',
       'send_followup', 'start_renewal', 'sync_inbox', 'update_draft', 'whats_due', 'who_handled',
     ]);
     for (const t of tools) {

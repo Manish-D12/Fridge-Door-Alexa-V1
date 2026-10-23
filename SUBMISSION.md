@@ -50,9 +50,9 @@ demo it.
 - **An MCP server, built the way Alexa+ connects.**
   - The server uses the official MCP TypeScript SDK with **Streamable HTTP** at `/mcp` and negotiates
     protocol version **2025-11-25**.
-  - It exposes 15 tools: `whats_due`, `next_up`, `add_obligation`, `mark_done`, `who_handled`,
+  - It exposes 16 tools: `whats_due`, `next_up`, `add_obligation`, `mark_done`, `who_handled`,
     `get_source`, `ingest_text`, `ingest_image`, `confirm_item`, `sync_inbox`, and the follow-up
-    tools `draft_followup`, `send_followup`, `discard_draft`, `update_draft` and `start_renewal`.
+    tools `draft_followup`, `send_followup`, `discard_draft`, `update_draft`, `start_renewal` and `get_followup_status`.
   - Every result has a `speech` sentence written to be read aloud, plus typed `structuredContent`
     for the screen.
 - **A real MCP client in the loop.**
@@ -98,7 +98,7 @@ demo it.
 | Email | Gmail API via `googleapis` |
 | Storage | DynamoDB |
 | Simulator | React 19, Vite and Tailwind 4, with the Web Speech API for voice in and out |
-| Tests | 116 server tests and 12 library tests on Node's built-in test runner, needing no network or API key. An end-to-end test drives every tool through the real SDK client over Streamable HTTP |
+| Tests | 129 server tests and 12 library tests on Node's built-in test runner, needing no network or API key. An end-to-end test drives every tool through the real SDK client over Streamable HTTP |
 
 ### Challenges we ran into
 

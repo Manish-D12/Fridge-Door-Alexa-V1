@@ -97,6 +97,10 @@ export const ObligationAction = z.object({
   summary: z.string().min(1).max(300),
   /** Recipient of email_sent. */
   to: z.string().max(320).nullable(),
+  /** reply_received: anything else the sender said, verbatim ("Please be on time"). */
+  note: z.string().max(400).nullable().default(null),
+  /** The Gmail message: the one sent (email_sent) or the reply (reply_received). */
+  messageId: z.string().max(200).nullable().default(null),
 });
 export type ObligationAction = z.infer<typeof ObligationAction>;
 
@@ -406,6 +410,31 @@ export const UpdateDraftResult = z.object({
 });
 export type UpdateDraftResult = z.infer<typeof UpdateDraftResult>;
 
+export const GetFollowupStatusInput = z.object({
+  idOrTitle: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe('The item asked about, e.g. "dentist". Omit for every follow-up still waiting or answered recently.'),
+  ...ItemHints,
+});
+export type GetFollowupStatusInput = z.infer<typeof GetFollowupStatusInput>;
+
+export const FollowupStatus = z.object({
+  item: ObligationSchema,
+  state: z.enum(['none', 'waiting', 'replied']),
+  sent: ObligationAction.nullable().describe('The latest follow-up email sent.'),
+  reply: ObligationAction.nullable().describe('The reply to it, if any.'),
+});
+export type FollowupStatus = z.infer<typeof FollowupStatus>;
+
+export const GetFollowupStatusResult = z.object({
+  speech: Speech,
+  followups: z.array(FollowupStatus),
+});
+export type GetFollowupStatusResult = z.infer<typeof GetFollowupStatusResult>;
+
 export const StartRenewalResult = z.object({
   speech: Speech,
   item: ObligationSchema,
@@ -455,8 +484,19 @@ export const SyncInboxResult = IngestResult.extend({
     remaining: z.number().int().describe('Not looked at yet: over the per-sync limit. The next sync reads them.'),
   }),
   replies: z
-    .array(z.object({ id: z.string(), title: z.string(), from: z.string() }))
-    .describe('Items awaiting a reply whose thread now has one.'),
+    .array(
+      z.object({
+        id: z.string(),
+        title: z.string(),
+        from: z.string(),
+        /** What the reply did, e.g. "agreed to move it to Thursday, October 29 at 4:00 PM". */
+        summary: z.string(),
+        note: z.string().nullable(),
+        /** True when the reply changed the item (new date, or cancelled). */
+        updated: z.boolean(),
+      }),
+    )
+    .describe('Replies to follow-up emails, matched by thread and applied before anything else is read.'),
 });
 export type SyncInboxResult = z.infer<typeof SyncInboxResult>;
 

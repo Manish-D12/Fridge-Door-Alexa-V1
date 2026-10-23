@@ -4,7 +4,19 @@ import { AppError } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import type { IncomingEmail, ObligationService, RequestContext } from '../service/obligations.js';
 import type { Mailer } from '../service/followups.js';
-import { actionLinks, buildReply, emailDocument, emailRef, GMAIL_QUERY, messageFromGmail, parseAddress, whyNotRelevant, type Mailbox, type OutgoingMail } from './mail.js';
+import {
+  actionLinks,
+  buildReply,
+  emailDocument,
+  emailRef,
+  GMAIL_QUERY,
+  messageFromGmail,
+  parseAddress,
+  whyNotRelevant,
+  type Mailbox,
+  type MailMessage,
+  type OutgoingMail,
+} from './mail.js';
 import type { GmailState } from './state.js';
 
 export const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
@@ -115,8 +127,32 @@ export class GmailSync implements Mailer {
 
   /** One sync at a time, so two quick "check my email"s can't send the same email to the model twice. */
   sync(ctx: RequestContext): Promise<SyncInboxResult> {
-    this.running ??= this.syncOnce(ctx).finally(() => (this.running = undefined));
+    this.running ??= this.exclusive(() => this.syncOnce(ctx)).finally(() => (this.running = undefined));
     return this.running;
+  }
+
+  /**
+   * For "did they reply?": looks at follow-up threads now, and nothing else.
+   * Metadata and text only, no model calls. Runs after any sync in progress,
+   * so a reply is never applied twice.
+   */
+  async refreshFollowups(ctx: RequestContext): Promise<SyncInboxResult['replies']> {
+    if (!this.opts.oauth) return [];
+    return this.exclusive(async () => {
+      const state = await this.opts.state.read();
+      if (!state.refreshToken) return [];
+      const { replies, handled } = await this.handleReplies(ctx, this.mailboxFor(state.refreshToken), state.account);
+      if (handled.length > 0) await this.opts.state.markProcessed(handled);
+      return replies;
+    });
+  }
+
+  /** Syncs and follow-up checks run one after another, never side by side. */
+  private lock: Promise<unknown> = Promise.resolve();
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.lock.then(fn, fn);
+    this.lock = next.catch(() => undefined);
+    return next;
   }
 
   private async syncOnce(ctx: RequestContext): Promise<SyncInboxResult> {
@@ -128,15 +164,22 @@ export class GmailSync implements Mailer {
       throw new AppError('bad_request', "Gmail isn't connected yet. Open settings on the screen and tap Connect Gmail.");
     }
     const mailbox = this.mailboxFor(state.refreshToken);
-    const replies = await this.checkReplies(ctx, mailbox, state.account);
+    // Follow-up threads first: a reply belongs to the item it answers, so it is
+    // applied there and never classified as a new bill or appointment.
+    const { replies, handled, threads } = await this.handleReplies(ctx, mailbox, state.account);
 
-    const ids = await this.gmail(() => mailbox.search(GMAIL_QUERY, SEARCH_LIMIT));
-    const fresh = ids.filter((id) => !state.processed[id]);
+    const found = await this.gmail(() => mailbox.search(GMAIL_QUERY, SEARCH_LIMIT));
+    const ids = found.map((m) => m.id);
+    const conversation = found.filter((m) => threads.has(m.threadId) && !state.processed[m.id]).map((m) => m.id);
+    const skip = new Set([...handled, ...conversation]);
+    if (skip.size > 0) await this.opts.state.markProcessed([...skip]);
+    const fresh = ids.filter((id) => !state.processed[id] && !skip.has(id));
     const toRead: ({ id: string } & IncomingEmail)[] = [];
     const ruledOut: string[] = [];
     // One line per sync saying what happened to each matching email, for "why didn't it see my email?".
     const decisions: Record<string, string> = {};
     for (const id of ids) if (state.processed[id]) decisions[id] = `already handled ${state.processed[id]}`;
+    for (const id of skip) if (ids.includes(id)) decisions[id] = 'reply in a follow-up thread: applied to its item, not read as new';
     let looked = 0;
     for (const id of fresh) {
       if (toRead.length >= this.opts.maxEmails) break;
@@ -188,7 +231,7 @@ export class GmailSync implements Mailer {
       if (failed > 0) speech += ` I couldn't read ${failed} more right now; I'll retry later.`;
     }
     if (replies.length > 0) {
-      const heard = replies.slice(0, 3).map((r) => `${r.from} replied about ${r.title}.`).join(' ');
+      const heard = replies.slice(0, 3).map(replySpeech).join(' ');
       speech = !result && looked === 0 ? `${heard} Nothing else new.` : `${heard} ${speech}`;
     }
     const ingest = result ?? { kind: 'text' as const, source: 'gmail' as const, items: [], needsConfirmation: [], skipped: [], transcript: null };
@@ -196,34 +239,54 @@ export class GmailSync implements Mailer {
   }
 
   /**
-   * For each item waiting on a reply, looks for a newer message in its thread
-   * from someone else. Found: the item goes back to pending with the reply in
-   * its history. Metadata only, no model call. A failure here doesn't stop the sync.
+   * Reads the thread of every follow-up still waiting for an answer. The first
+   * message from someone else after the one we sent (by Gmail's own order and
+   * clock, never ours) is the reply: it is read without a model, applied to the
+   * item (a yes to a reschedule moves it; a yes to a cancel closes it), and kept
+   * in its history with anything else they said. A failing thread is skipped.
+   *
+   * Returns the replies, the message ids it handled, and every follow-up thread,
+   * so the rest of the sync leaves those conversations alone.
    */
-  private async checkReplies(ctx: RequestContext, mailbox: Mailbox, account: string | null): Promise<SyncInboxResult['replies']> {
-    const found: SyncInboxResult['replies'] = [];
-    for (const item of await this.opts.service.awaitingReply(ctx)) {
-      const sent = item.actions.findLast((a) => a.type === 'email_sent');
-      if (!item.email || !sent) continue;
-      let senders: string[];
+  private async handleReplies(
+    ctx: RequestContext,
+    mailbox: Mailbox,
+    account: string | null,
+  ): Promise<{ replies: SyncInboxResult['replies']; handled: string[]; threads: Set<string> }> {
+    const replies: SyncInboxResult['replies'] = [];
+    const handled: string[] = [];
+    const threads = await this.opts.service.followupThreads(ctx);
+    const own = (account ?? '').toLowerCase();
+    const mine = (m: MailMessage) => m.labels.includes('SENT') || parseAddress(m.from)?.address === own;
+
+    for (const item of await this.opts.service.followupsWaiting(ctx)) {
+      const sent = item.actions.findLast((a) => a.type === 'email_sent')!;
+      let messages: MailMessage[];
       try {
-        senders = await mailbox.repliesInThread(item.email.threadId, Date.parse(sent.at), account ?? '');
+        messages = await this.gmail(() => mailbox.thread(item.email!.threadId));
       } catch (err) {
-        this.opts.logger.warn('gmail: could not check a thread for replies', { err: (err as Error).message });
+        this.opts.logger.warn('gmail: could not read a follow-up thread', { item: item.id, err: (err as Error).message });
         continue;
       }
-      if (senders.length === 0) continue;
-      const sender = parseAddress(senders.at(-1)!);
-      const from = sender?.name ?? sender?.address ?? item.email.fromName ?? item.email.fromAddress;
-      await this.opts.service.logAction(
-        ctx,
-        item.id,
-        { type: 'reply_received', intent: null, at: new Date(this.now()).toISOString(), by: from, summary: 'replied', to: null },
-        'pending',
-      );
-      found.push({ id: item.id, title: item.title, from });
+      // Our message: by id when we have it, else ours from around the time we sent it.
+      let at = sent.messageId ? messages.findIndex((m) => m.id === sent.messageId) : -1;
+      if (at < 0) at = messages.findLastIndex((m) => mine(m) && m.receivedAt >= Date.parse(sent.at) - 10 * 60_000);
+      const theirs = (at >= 0 ? messages.slice(at + 1) : messages.filter((m) => m.receivedAt > Date.parse(sent.at))).filter((m) => !mine(m));
+      this.opts.logger.info('gmail: follow-up thread checked', { item: item.id, thread: item.email!.threadId, messages: messages.length, replies: theirs.length });
+      if (theirs.length === 0) continue;
+
+      const reply = theirs[0]!;
+      const applied = await this.opts.service.applyReply(ctx, item, sent, {
+        id: reply.id,
+        from: parseAddress(reply.from)?.name ?? parseAddress(reply.from)?.address ?? item.email!.fromName ?? item.email!.fromAddress,
+        text: reply.text,
+        receivedAt: reply.receivedAt,
+        ours: at >= 0 ? messages[at]!.text : '',
+      });
+      replies.push(applied);
+      handled.push(...theirs.map((m) => m.id));
     }
-    return found;
+    return { replies, handled, threads };
   }
 
   private mailboxFor(refreshToken: string): Mailbox {
@@ -277,9 +340,9 @@ class GoogleMailbox implements Mailbox {
     return data.emailAddress ?? 'your Gmail';
   }
 
-  async search(query: string, max: number): Promise<string[]> {
+  async search(query: string, max: number) {
     const { data } = await this.api.users.messages.list({ userId: 'me', q: query, maxResults: max });
-    return (data.messages ?? []).flatMap((m) => (m.id ? [m.id] : []));
+    return (data.messages ?? []).flatMap((m) => (m.id ? [{ id: m.id, threadId: m.threadId ?? m.id }] : []));
   }
 
   async get(id: string) {
@@ -287,17 +350,18 @@ class GoogleMailbox implements Mailbox {
     return messageFromGmail(data);
   }
 
-  async repliesInThread(threadId: string, afterMs: number, own: string): Promise<string[]> {
-    const { data } = await this.api.users.threads.get({ userId: 'me', id: threadId, format: 'metadata', metadataHeaders: ['From'] });
-    return (data.messages ?? []).flatMap((m) => {
-      const from = m.payload?.headers?.find((h) => h.name?.toLowerCase() === 'from')?.value ?? '';
-      const mine = m.labelIds?.includes('SENT') || parseAddress(from)?.address === own.toLowerCase();
-      return Number(m.internalDate ?? 0) > afterMs && !mine && from ? [from] : [];
-    });
+  async thread(threadId: string) {
+    const { data } = await this.api.users.threads.get({ userId: 'me', id: threadId, format: 'full' });
+    return (data.messages ?? []).map(messageFromGmail).sort((a, b) => a.receivedAt - b.receivedAt);
   }
 
   async send(raw: string, threadId: string): Promise<string> {
     const { data } = await this.api.users.messages.send({ userId: 'me', requestBody: { raw, threadId } });
     return data.id ?? '';
   }
+}
+
+/** "Dr. Lee replied about Dentist appointment: they agreed to move it to Thursday, October 29 at 4:00 PM. They added: "Please be on time."" */
+export function replySpeech(r: SyncInboxResult['replies'][number]): string {
+  return `${r.from} replied about ${r.title}: they ${r.summary}.${r.note ? ` They added: "${r.note}"` : ''}`;
 }

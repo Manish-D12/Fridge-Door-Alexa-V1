@@ -16,16 +16,18 @@ export interface MailMessage {
   references: string | null;
   /** Every link in the body, with its text when it came from HTML. Unfiltered. */
   links: { url: string; text: string }[];
+  /** Gmail's internalDate (ms): when Gmail received or sent it. Gmail's clock, not ours. */
+  receivedAt: number;
 }
 
 /** The Gmail calls sync and replies make; tests stand in for it. */
 export interface Mailbox {
   account(): Promise<string>;
-  /** Message ids matching a Gmail search, newest first. */
-  search(query: string, max: number): Promise<string[]>;
+  /** Messages matching a Gmail search, newest first. */
+  search(query: string, max: number): Promise<{ id: string; threadId: string }[]>;
   get(id: string): Promise<MailMessage>;
-  /** Senders (From headers) of messages in a thread received after `afterMs`, other than `own`. */
-  repliesInThread(threadId: string, afterMs: number, own: string): Promise<string[]>;
+  /** Every message in a thread, oldest first. */
+  thread(threadId: string): Promise<MailMessage[]>;
   /** Sends a raw RFC 5322 message into the thread. Returns the new message id. */
   send(raw: string, threadId: string): Promise<string>;
 }
@@ -140,6 +142,7 @@ export function messageFromGmail(m: gmail_v1.Schema$Message): MailMessage {
     messageIdHeader: headers.get('message-id')?.trim() || null,
     references: headers.get('references')?.trim() || null,
     links,
+    receivedAt: Number(m.internalDate ?? 0),
   };
 }
 

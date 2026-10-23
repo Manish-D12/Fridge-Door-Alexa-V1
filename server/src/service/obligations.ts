@@ -25,6 +25,7 @@ import {
   type ObligationType,
   type Source,
   type Status,
+  type SyncInboxResult,
   type WhatsDueInput,
   type WhatsDueResult,
   type WhoHandledInput,
@@ -44,6 +45,7 @@ import {
 } from '../lib/time.js';
 import type { ObligationStore } from '../store/types.js';
 import { joinSpoken, normalize, resolveObligation, similarTitles, type ResolveOptions } from './match.js';
+import { proposedInstant, proposedTime, readReply, replyEffect } from './replies.js';
 
 /** Who is asking. Derived from the transport (headers), never from tool arguments. */
 export interface RequestContext {
@@ -140,6 +142,18 @@ export function sameName(a: string | null | undefined, b: string | null | undefi
 
 export function isVisibleTo(o: Obligation, ctx: RequestContext): boolean {
   return !o.private || sameName(o.addedBy, ctx.userId);
+}
+
+/** Whether a follow-up email went out about an item, and whether it was answered. */
+export function followupState(o: Obligation): 'none' | 'waiting' | 'replied' {
+  const sent = o.actions.findLastIndex((a) => a.type === 'email_sent');
+  if (sent < 0) return 'none';
+  return o.actions.findLastIndex((a) => a.type === 'reply_received') > sent ? 'replied' : 'waiting';
+}
+
+/** "Thursday, October 29 at 4:00 PM" in the household time zone. */
+export function longWhen(ms: number, timeZone: string): string {
+  return new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(ms);
 }
 
 /** Not done yet: pending, waiting for a reply, or mid-renewal. */
@@ -390,27 +404,80 @@ export class ObligationService {
   }
 
   /** One visible obligation by id or title words (plus any day or sender hints); ties are asked about, not guessed. */
-  async resolve(ctx: RequestContext, idOrTitle: string, opts: Partial<Pick<ResolveOptions, 'prefer' | 'hints' | 'preferEmail'>> = {}): Promise<Obligation> {
+  async resolve(ctx: RequestContext, idOrTitle: string, opts: Partial<Pick<ResolveOptions, 'prefer' | 'hints' | 'preferEmail' | 'preferFollowup'>> = {}): Promise<Obligation> {
     return resolveObligation(await this.visible(ctx), idOrTitle, { prefer: 'open', ...opts, now: this.now(), timeZone: this.opts.timeZone });
   }
 
   /** Appends to the item's action history and optionally moves its status. Returns the saved item. */
-  async logAction(ctx: RequestContext, id: string, action: ObligationAction, status?: Status): Promise<Obligation> {
+  async logAction(
+    ctx: RequestContext,
+    id: string,
+    action: ObligationAction,
+    status?: Status,
+    patch: Partial<Pick<Obligation, 'dueDate' | 'doneBy' | 'doneAt'>> = {},
+  ): Promise<Obligation> {
     const existing = await this.store.get(ctx.householdId, id);
     if (!existing || !isVisibleTo(existing, ctx)) throw notFound(`I couldn't find an item with id "${id}".`);
+    // Done stays done: a late reply or a renewal click doesn't reopen it.
+    const keepDone = existing.status === 'done';
     const item = ObligationSchema.parse({
       ...existing,
-      // Done stays done: a late reply or a renewal click doesn't reopen it.
-      status: status && existing.status !== 'done' ? status : existing.status,
+      ...(keepDone ? {} : patch),
+      status: status && !keepDone ? status : existing.status,
       actions: [...existing.actions, action].slice(-50),
     });
     await this.store.put(item);
     return item;
   }
 
-  /** Open items from real Gmail whose sender hasn't answered our follow-up yet. */
-  async awaitingReply(ctx: RequestContext): Promise<Obligation[]> {
-    return (await this.visible(ctx)).filter((o) => o.status === 'awaiting_reply' && o.email && !o.email.demo);
+  /** Items from real Gmail with a follow-up email that hasn't been answered yet. */
+  async followupsWaiting(ctx: RequestContext): Promise<Obligation[]> {
+    return (await this.visible(ctx)).filter((o) => o.email && !o.email.demo && followupState(o) === 'waiting');
+  }
+
+  /** Threads we have written into: messages there are conversation about an item, not new items. */
+  async followupThreads(ctx: RequestContext): Promise<Set<string>> {
+    const items = (await this.visible(ctx)).filter((o) => o.email && !o.email.demo && o.actions.some((a) => a.type === 'email_sent'));
+    return new Set(items.map((o) => o.email!.threadId));
+  }
+
+  /**
+   * Applies a reply to our follow-up, without a model: a yes to a reschedule
+   * moves the item to the time our email proposed; a yes to a cancel closes
+   * it; anything else is recorded as said. Their other words are kept as a note.
+   */
+  async applyReply(
+    ctx: RequestContext,
+    item: Obligation,
+    sent: ObligationAction,
+    reply: { id: string; from: string; text: string; receivedAt: number; ours: string },
+  ): Promise<SyncInboxResult['replies'][number]> {
+    const { timeZone } = this.opts;
+    const reading = readReply(reply.text);
+    const due = Date.parse(item.dueDate);
+    const proposed = sent.intent === 'reschedule' && reply.ours ? proposedTime(reply.ours, due, this.now(), timeZone) : null;
+    const newDue = proposed ? proposedInstant(proposed, due, timeZone) : null;
+    const effect = replyEffect(sent.intent, reading, newDue);
+    const quote = `"${reading.gist.replace(/[.!?]+$/, '')}"`;
+    const summary =
+      effect === 'move'
+        ? `agreed to move it to ${longWhen(newDue!, timeZone)}`
+        : effect === 'cancel'
+          ? 'confirmed the cancellation'
+          : reading.outcome === 'declined'
+            ? `said no: ${quote}`
+            : reading.outcome === 'accepted'
+              ? `said yes: ${quote}`
+              : `wrote: ${quote}`;
+    const at = new Date(reply.receivedAt || this.now()).toISOString();
+    await this.logAction(
+      ctx,
+      item.id,
+      { type: 'reply_received', intent: sent.intent, at, by: reply.from, summary, to: null, note: reading.note, messageId: reply.id },
+      effect === 'cancel' ? 'done' : 'pending',
+      effect === 'move' ? { dueDate: new Date(newDue!).toISOString() } : effect === 'cancel' ? { doneBy: sent.by, doneAt: at } : {},
+    );
+    return { id: item.id, title: item.title, from: reply.from, summary, note: reading.note, updated: effect !== 'none' };
   }
 
   // -------------------------------------------------------------------------

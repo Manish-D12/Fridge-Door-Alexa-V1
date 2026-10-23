@@ -232,6 +232,18 @@ describe('matching several items with the same name', () => {
     assert.equal(err.message, 'Do you mean the Tuesday one from Bright Smiles or the Tuesday one from SmileCare Dental?');
   });
 
+  it('prefers the one with a follow-up email when asked whether they replied', async () => {
+    const asked = {
+      ...TUESDAY,
+      id: 'wed',
+      dueDate: '2026-10-28T22:30:00.000Z',
+      actions: [{ type: 'email_sent' as const, intent: 'reschedule' as const, at: '2026-10-21T16:00:00.000Z', by: 'Priya', summary: 'emailed', to: 'x@y.com', note: null, messageId: null }],
+    };
+    const s = await setup([MONDAY, TUESDAY, asked]);
+    assert.equal((await s.resolve(ctx, 'dentist', { preferEmail: true, preferFollowup: true })).id, 'wed');
+    await rejectsWith(s.resolve(ctx, 'dentist', { preferEmail: true }), 'ambiguous');
+  });
+
   it('still settles on a single item by title alone', async () => {
     const s = await setup([MONDAY, TUESDAY, ob({ id: 'vet', type: 'appointment', title: 'Vet checkup', dueDate: '2026-10-26T22:30:00.000Z' })]);
     assert.equal((await s.resolve(ctx, 'vet')).id, 'vet');

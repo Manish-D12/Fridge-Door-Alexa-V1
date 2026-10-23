@@ -6,7 +6,7 @@ import type { OutgoingMail } from '../src/gmail/mail.js';
 import { AppError } from '../src/lib/errors.js';
 import { silentLogger } from '../src/lib/logger.js';
 import type { JsonRequest } from '../src/llm/types.js';
-import { DRAFT_TTL_MS, FollowUps, type Mailer } from '../src/service/followups.js';
+import { DRAFT_TTL_MS, FollowUps, formatEmailBody, type Mailer } from '../src/service/followups.js';
 import { ObligationService } from '../src/service/obligations.js';
 import { FakeProvider, FIXTURES, HOUSEHOLD, NOW, ob, TZ, tempStore } from './helpers.js';
 
@@ -194,6 +194,8 @@ describe('follow-up actions', async () => {
         by: 'Priya',
         summary: "emailed Bright Smiles Dental to move Maya's cleaning to Thursday afternoon",
         to: 'dr.smile@brightsmiles.com',
+        note: null,
+        messageId: 'm-1',
       },
     ]);
 
@@ -293,5 +295,55 @@ describe('follow-up actions', async () => {
     assert.match(dentist.speech, /didn't include a renewal link\. Want me to draft a reply to Bright Smiles Dental asking how to renew\?/);
     const water = await followups.startRenewal(priya, { idOrTitle: 'water bill' });
     assert.match(water.speech, /I don't have a renewal link for Water bill, since it came from/);
+  });
+
+  it('lays out a draft the model returned on one line', async () => {
+    // What Gemini returned for the real follow-up.
+    assert.equal(
+      formatEmailBody(
+        'Hello,I would like to reschedule my dentist cleaning appointment for Wednesday, October 28th at 3:30 PM. Would it be possible to move it to Thursday, October 29th at 4 PM instead?Thank you,Priya',
+      ),
+      'Hello,\n\nI would like to reschedule my dentist cleaning appointment for Wednesday, October 28th at 3:30 PM. Would it be possible to move it to Thursday, October 29th at 4 PM instead?\n\nThank you,\nPriya',
+    );
+    assert.equal(formatEmailBody('Hi Dr. Lee, could we cancel? Best regards Priya Shah'), 'Hi Dr. Lee,\n\ncould we cancel?\n\nBest regards,\nPriya Shah');
+    const already = 'Hi,\n\nCould we move it?\n\n\n\nThanks,\nPriya';
+    assert.equal(formatEmailBody(already), 'Hi,\n\nCould we move it?\n\nThanks,\nPriya', 'existing line breaks are kept');
+
+    const { followups, provider } = await setup();
+    provider.reply = { body: 'Hello,Could we cancel?Thanks,Priya', gist: 'cancel the cleaning' };
+    const { draft } = await followups.draft(priya, { idOrTitle: 'dentist', intent: 'cancel' });
+    assert.equal(draft!.body, 'Hello,\n\nCould we cancel?\n\nThanks,\nPriya');
+    assert.match(provider.jsonRequests[0]!.system, /greeting on its own line/);
+  });
+
+  it('answers "did they reply?" from the item history', async () => {
+    const { followups, service, clock } = await setup();
+    assert.equal((await followups.status(priya, { idOrTitle: 'dentist' })).speech, 'No follow-up email has been sent about Dentist appointment.');
+    assert.equal((await followups.status(priya, { idOrTitle: 'water bill' })).followups[0]!.state, 'none');
+
+    const { draft } = await followups.draft(priya, { idOrTitle: 'dentist', intent: 'reschedule', details: 'Thursday afternoon' });
+    const { item: sentItem } = await followups.send(priya, { draftId: draft!.id, confirmedBy: 'Priya' });
+    clock.advance(12 * 60_000);
+    const waiting = await followups.status(priya, { idOrTitle: 'dentist' });
+    assert.equal(waiting.followups[0]!.state, 'waiting');
+    assert.equal(waiting.speech, "Not yet. You emailed Bright Smiles Dental to move Maya's cleaning to Thursday afternoon 12 minutes ago. No reply yet.");
+    assert.match((await followups.status(dan, { idOrTitle: 'dentist' })).speech, /^Not yet\. Priya emailed/);
+
+    await service.applyReply(priya, sentItem, sentItem.actions.at(-1)!, {
+      id: 'r1',
+      from: 'Bright Smiles Dental',
+      text: 'Yes, Thursday at 2 works. Please arrive 10 minutes early.',
+      receivedAt: NOW + 5 * 60_000,
+      ours: "Could we move Maya's cleaning on Saturday, October 24 to Thursday, October 29 at 2 PM?",
+    });
+    const replied = await followups.status(priya, { idOrTitle: 'dentist' });
+    assert.equal(replied.followups[0]!.state, 'replied');
+    assert.equal(replied.followups[0]!.item.dueDate, '2026-10-29T21:00:00.000Z', 'moved to Thu Oct 29, 2:00 PM');
+    assert.equal(
+      replied.speech,
+      'Yes. Bright Smiles Dental replied about Dentist appointment 7 minutes ago: they agreed to move it to Thursday, October 29 at 2:00 PM. They added: "Please arrive 10 minutes early."',
+    );
+    const all = await followups.status(priya, {});
+    assert.deepEqual(all.followups.map((f) => [f.item.id, f.state]), [['dentist', 'replied']]);
   });
 });

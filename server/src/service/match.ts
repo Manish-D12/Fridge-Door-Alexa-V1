@@ -63,6 +63,8 @@ export interface ResolveOptions {
   hints?: MatchHints;
   /** On a tie, keep items read from an email: a follow-up can only reply to those. */
   preferEmail?: boolean;
+  /** On a tie, keep items we have sent a follow-up email about ("did the dentist reply?"). */
+  preferFollowup?: boolean;
 }
 
 /** A title that contains every word the person said ("dentist") counts as fully matching. */
@@ -100,6 +102,7 @@ export function resolveObligation(items: Obligation[], idOrTitle: string, opts: 
     top = scored.map((x) => x.o);
   }
 
+  if (fitting.length > 0 && top.length > 1 && opts.preferFollowup) top = narrow(top, (o) => o.actions.some((a) => a.type === 'email_sent'));
   if (fitting.length > 0 && top.length > 1 && opts.preferEmail) top = narrow(top, (o) => !!o.email);
   if (fitting.length > 0 && top.length > 1) top = narrow(top, (o) => (o.status === 'done') === (opts.prefer === 'done'));
   if (top.length === 1) return top[0]!;

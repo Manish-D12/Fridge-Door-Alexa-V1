@@ -47,6 +47,8 @@ export default function App() {
   const [comingUp, setComingUp] = useState<{ items: Obligation[]; loaded: boolean }>({ items: [], loaded: false });
   const [offline, setOffline] = useState(false);
   const session = useRef<string | undefined>(undefined);
+  /** Numbers each request; only the newest may change the screen, so a slow reply can't replace a newer one. */
+  const latest = useRef(0);
   const dismissTimer = useRef<number | undefined>(undefined);
   const memberRef = useRef(member.name);
   memberRef.current = member.name;
@@ -81,6 +83,7 @@ export default function App() {
   const clearDismiss = () => window.clearTimeout(dismissTimer.current);
 
   const dismiss = useCallback(() => {
+    latest.current++;
     clearDismiss();
     stopSpeaking();
     setExchange(null);
@@ -118,15 +121,17 @@ export default function App() {
 
   const ask = useCallback(
     async (text: string) => {
+      const turn = ++latest.current;
       clearDismiss();
       stopSpeaking();
       setInterim('');
       setExchange({ heard: text, photo: null, reply: null, error: null });
       setPhase('thinking');
       try {
-        present(await api.chat(memberRef.current, text, session.current));
+        const reply = await api.chat(memberRef.current, text, session.current);
+        if (turn === latest.current) present(reply);
       } catch (err) {
-        fail(err);
+        if (turn === latest.current) fail(err);
       }
     },
     [present, fail],
@@ -134,21 +139,21 @@ export default function App() {
 
   const sendPhoto = useCallback(
     async (photo: Photo) => {
+      const turn = ++latest.current;
       setCameraOpen(false);
       clearDismiss();
       stopSpeaking();
       setExchange({ heard: null, photo: photo.previewUrl, reply: null, error: null });
       setPhase('thinking');
       try {
-        present(
-          await api.action(memberRef.current, {
-            tool: 'ingest_image',
-            arguments: { base64: photo.base64, mimeType: photo.mimeType },
-            sessionId: session.current,
-          }),
-        );
+        const reply = await api.action(memberRef.current, {
+          tool: 'ingest_image',
+          arguments: { base64: photo.base64, mimeType: photo.mimeType },
+          sessionId: session.current,
+        });
+        if (turn === latest.current) present(reply);
       } catch (err) {
-        fail(err);
+        if (turn === latest.current) fail(err);
       }
     },
     [present, fail],
@@ -156,11 +161,13 @@ export default function App() {
 
   const confirm = useCallback(
     async (id: string, date: string) => {
+      const turn = ++latest.current;
       clearDismiss();
       stopSpeaking();
       setPhase('thinking');
       try {
         const reply = await api.action(memberRef.current, { tool: 'confirm_item', arguments: { id, chosenDate: date }, sessionId: session.current });
+        if (turn !== latest.current) return;
         session.current = reply.sessionId;
         // Fold the answer into the card on screen, so other questions stay answerable.
         let remaining = 0;
@@ -172,7 +179,7 @@ export default function App() {
         void refresh();
         say(reply.speech, remaining > 0);
       } catch (err) {
-        fail(err);
+        if (turn === latest.current) fail(err);
       }
     },
     [refresh, say, fail],
@@ -181,13 +188,15 @@ export default function App() {
   /** A button on a card: straight to an MCP tool, no model. */
   const act = useCallback(
     async (input: AgentActionInput) => {
+      const turn = ++latest.current;
       clearDismiss();
       stopSpeaking();
       setPhase('thinking');
       try {
-        present(await api.action(memberRef.current, { ...input, sessionId: session.current }));
+        const reply = await api.action(memberRef.current, { ...input, sessionId: session.current });
+        if (turn === latest.current) present(reply);
       } catch (err) {
-        fail(err);
+        if (turn === latest.current) fail(err);
       }
     },
     [present, fail],
@@ -225,6 +234,7 @@ export default function App() {
       return;
     }
     if (rec.listening) return;
+    latest.current++;
     clearDismiss();
     stopSpeaking();
     earcon();
