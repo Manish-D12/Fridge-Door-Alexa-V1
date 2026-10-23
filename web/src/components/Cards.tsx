@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AgentCard, GetSourceResult, IngestResult, Obligation, WhatsDueResult } from '@fridge-door/shared';
 import { CalendarCheck, CircleAlert, CircleCheck, CircleHelp, Lock, Quote, ShieldCheck, Sparkles } from 'lucide-react';
 import { ago, isOverdue, money, plainDate, SOURCE_NOUN, TYPE_LABEL, when, whenText } from '../format';
@@ -53,7 +53,36 @@ function Panel({ icon, heading, aside, children }: { icon: React.ReactNode; head
         </div>
         {aside}
       </div>
-      <div className="no-scrollbar -mx-1 min-h-0 overflow-y-auto px-1">{children}</div>
+      <ScrollArea>{children}</ScrollArea>
+    </div>
+  );
+}
+
+/** Scrolls without a scrollbar, fading out the bottom edge while there is more below. */
+function ScrollArea({ children }: { children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const check = () => setMore(el.scrollHeight - el.scrollTop - el.clientHeight > 4);
+    check();
+    const observer = new ResizeObserver(check);
+    observer.observe(el);
+    if (el.firstElementChild) observer.observe(el.firstElementChild);
+    el.addEventListener('scroll', check, { passive: true });
+    return () => {
+      observer.disconnect();
+      el.removeEventListener('scroll', check);
+    };
+  }, []);
+  return (
+    <div
+      ref={ref}
+      className="no-scrollbar -mx-1 min-h-0 overflow-y-auto px-1 transition-[mask-image]"
+      style={more ? { maskImage: 'linear-gradient(to bottom, black calc(100% - 56px), transparent)' } : undefined}
+    >
+      {children}
     </div>
   );
 }

@@ -4,6 +4,22 @@ import type { ChatMessage, ChatRequest, ChatResponse, JsonRequest, LlmImage, Llm
 /** Called when a model is out of quota or overloaded and the next one is tried. */
 export type FallbackListener = (info: { from: string; to: string; reason: string }) => void;
 
+export interface RequestInfo {
+  /** Requests sent to Gemini by this process, including ones that failed or fell back. */
+  total: number;
+  model: string;
+  /** Requests sent to this model by this process (free-tier quotas are per model, per day). */
+  modelTotal: number;
+  kind: 'text' | 'json' | 'chat';
+}
+/** Called just before every request to Gemini, so quota use is visible. Cache hits never get here. */
+export type RequestListener = (info: RequestInfo) => void;
+
+export interface GeminiListeners {
+  onFallback?: FallbackListener;
+  onRequest?: RequestListener;
+}
+
 /** One model request; a fallback model gets its own. */
 const REQUEST_TIMEOUT_MS = 45_000;
 
@@ -18,12 +34,14 @@ export class GeminiProvider implements LlmProvider {
   /** The primary model first, then the fallbacks in order, without repeats. */
   readonly models: string[];
   private readonly client: GoogleGenAI;
+  private total = 0;
+  private readonly perModel = new Map<string, number>();
 
   constructor(
     apiKey: string,
     model: string,
     fallbackModels: string[] = [],
-    private readonly onFallback?: FallbackListener,
+    private readonly listeners: GeminiListeners = {},
   ) {
     this.client = new GoogleGenAI({ apiKey, httpOptions: { timeout: REQUEST_TIMEOUT_MS } });
     this.models = [...new Set([model, ...fallbackModels])];
@@ -32,19 +50,19 @@ export class GeminiProvider implements LlmProvider {
 
   async generateText(req: TextRequest): Promise<string> {
     const res = await withModelFallback(this.models, (model) =>
-      this.client.models.generateContent({
+      this.send('text', {
         model,
         contents: [{ role: 'user', parts: parts(req.prompt, req.image) }],
         config: { systemInstruction: req.system, temperature: 0, ...quick(model) },
       }),
-      this.onFallback,
+      this.listeners.onFallback,
     );
     return res.text ?? '';
   }
 
   async generateJson(req: JsonRequest): Promise<unknown> {
     const res = await withModelFallback(this.models, (model) =>
-      this.client.models.generateContent({
+      this.send('json', {
         model,
         contents: [{ role: 'user', parts: parts(req.prompt) }],
         config: {
@@ -54,7 +72,7 @@ export class GeminiProvider implements LlmProvider {
           responseJsonSchema: req.schema,
         },
       }),
-      this.onFallback,
+      this.listeners.onFallback,
     );
     const text = res.text;
     if (!text) throw new Error(`Gemini returned no content (finish reason: ${res.candidates?.[0]?.finishReason ?? 'unknown'})`);
@@ -64,7 +82,7 @@ export class GeminiProvider implements LlmProvider {
   /** Function calling with plain declarations: Gemini returns the calls and we run them. */
   async chat(req: ChatRequest): Promise<ChatResponse> {
     const res = await withModelFallback(this.models, (model) =>
-      this.client.models.generateContent({
+      this.send('chat', {
         model,
         contents: req.messages.map(toContent),
         config: {
@@ -76,7 +94,7 @@ export class GeminiProvider implements LlmProvider {
             : undefined,
         },
       }),
-      this.onFallback,
+      this.listeners.onFallback,
     );
     const replyParts = res.candidates?.[0]?.content?.parts ?? [];
     const toolCalls: ToolCall[] = replyParts.flatMap((p, i) =>
@@ -86,6 +104,15 @@ export class GeminiProvider implements LlmProvider {
     );
     const text = replyParts.filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
     return { text, toolCalls };
+  }
+
+  /** Every request to Gemini goes through here, so it is counted exactly once. */
+  private send(kind: RequestInfo['kind'], params: Parameters<GoogleGenAI['models']['generateContent']>[0]) {
+    const modelTotal = (this.perModel.get(params.model) ?? 0) + 1;
+    this.perModel.set(params.model, modelTotal);
+    this.total++;
+    this.listeners.onRequest?.({ total: this.total, model: params.model, modelTotal, kind });
+    return this.client.models.generateContent(params);
   }
 }
 

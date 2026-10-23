@@ -28,6 +28,7 @@ let provider: LlmProvider;
 try {
   provider = createLlmProvider(loadConfig(), {
     onFallback: ({ from, to, reason }) => console.log(`  (${from}: ${reason}; falling back to ${to})`),
+    onRequest: ({ total, model, modelTotal }) => console.log(`  (gemini request #${total}, ${model}: ${modelTotal})`),
   });
 } catch (err) {
   console.error(`Can't run samples: ${(err as Error).message}. Set it in server/.env (see .env.example).`);

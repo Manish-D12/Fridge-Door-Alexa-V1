@@ -155,6 +155,23 @@ describe('withModelFallback', () => {
     assert.equal(isCapacityError(Object.assign(new Error('bad request'), { status: 400 })), false);
   });
 
+  it('counts every request, including the ones that fall back', async () => {
+    const seen: string[] = [];
+    const provider = new GeminiProvider('fake-key', 'lite', ['lite', 'flash'], {
+      onRequest: ({ total, model, modelTotal, kind }) => seen.push(`#${total} ${model}:${modelTotal} ${kind}`),
+    });
+    // Stub the SDK: no network. The first model is out of quota on the first call only.
+    let calls = 0;
+    (provider as unknown as { client: { models: { generateContent: unknown } } }).client.models.generateContent = async ({ model }: { model: string }) => {
+      if (model === 'lite' && calls++ === 0) throw quota;
+      return { text: '{"items":[]}', candidates: [] };
+    };
+    const req = { system: 's', prompt: 'p', name: 'n', schema: {} };
+    await provider.generateJson(req);
+    await provider.generateJson(req);
+    assert.deepEqual(seen, ['#1 lite:1 json', '#2 flash:1 json', '#3 lite:2 json']);
+  });
+
   it('puts the primary model first without repeating it', () => {
     assert.deepEqual(new GeminiProvider('key', 'gemini-2.5-flash-lite', ['gemini-2.5-flash-lite', 'gemini-2.0-flash']).models, ['gemini-2.5-flash-lite', 'gemini-2.0-flash']);
     assert.deepEqual(new GeminiProvider('key', 'gemini-2.5-flash', ['gemini-2.5-flash-lite']).models, ['gemini-2.5-flash', 'gemini-2.5-flash-lite']);

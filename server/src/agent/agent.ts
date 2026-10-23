@@ -90,12 +90,14 @@ export class Agent {
     let card: AgentCard | null = null;
     let lastToolSpeech: string | null = null;
     let speech = '';
+    let modelCalls = 0;
 
     const mcp = await this.connect(identity);
     try {
       const tools = await this.listTools(mcp);
       const system = this.systemPrompt(identity);
       for (let step = 0; step < MAX_STEPS && !speech; step++) {
+        modelCalls++;
         const res = await this.think(system, messages, tools);
         messages.push({ role: 'assistant', text: res.text, toolCalls: res.toolCalls });
         if (res.toolCalls.length === 0) {
@@ -123,7 +125,7 @@ export class Agent {
       messages.push({ role: 'assistant', text: speech, toolCalls: [] });
     }
     this.save(id, session, messages);
-    this.opts.logger.info('agent turn', { member: identity.member, tools: calls.map((c) => c.name), steps: calls.length });
+    this.opts.logger.info('agent turn', { member: identity.member, tools: calls.map((c) => c.name), modelCalls });
     return { speech, card, sessionId: id, toolCalls: calls };
   }
 

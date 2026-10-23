@@ -17,6 +17,8 @@ let agent: Agent | undefined;
 try {
   const provider = createLlmProvider(config, {
     onFallback: (info) => logger.warn('model quota exhausted; trying the next model', info),
+    onRequest: ({ total, model, modelTotal, kind }) =>
+      logger.info(`gemini request #${total} (${model}: ${modelTotal} since start)`, { kind }),
   });
   extractor = new Extractor(provider, config.HOUSEHOLD_TIMEZONE, new FileExtractionCache(config.EXTRACTION_CACHE_DIR));
   agent = new Agent({
