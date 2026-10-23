@@ -2,13 +2,18 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# Local JSON store (STORAGE=local)
+# Local data: JSON store, extraction cache, Gmail refresh token (STORAGE=local)
+.data/
 server/.data/
 
-# Env
+# Env and secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+client_secret*.json
+credentials*.json
 
 # OS / editor
 .DS_Store

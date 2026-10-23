@@ -1,0 +1,52 @@
+{
+  "name": "obligation-extractor",
+  "version": "0.1.0",
+  "description": "Turn untrusted emails, messages and photo transcripts into verified household obligations (bills, deliveries, appointments, deadlines) with any LLM. Prompt, JSON schema, source-snippet verifier and prompt-injection guard.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "llm",
+    "extraction",
+    "prompt-injection",
+    "structured-output",
+    "gemini",
+    "bedrock",
+    "mcp",
+    "alexa"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Manish-D12/obligation-extractor.git"
+  }
+}

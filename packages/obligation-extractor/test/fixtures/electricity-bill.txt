@@ -1,0 +1,21 @@
+From: Pacific Valley Power <billing@pvpower.example.com>
+Subject: Your October energy statement is ready
+Date: Wed, 21 Oct 2026 06:10:44 -0700
+
+Hi Dan,
+
+Your Pacific Valley Power statement for service from Sep 18 - Oct 18, 2026 is ready.
+
+Account number: ****-****-8821
+Statement date: 10/20/2026
+
+Electric charges:       $118.42
+Gas charges:             $23.95
+Total amount due:       $142.37
+Due date:               November 9, 2026
+
+A late fee of $10.00 may be added if payment is not received by the due date.
+
+You are not enrolled in AutoPay. Pay online at pvpower.example.com/pay or call 1-800-555-0142.
+
+Thank you for being a Pacific Valley Power customer.
