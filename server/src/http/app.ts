@@ -7,12 +7,14 @@ import {
 import type { ApiError } from '@fridge-door/shared';
 import type { Agent } from '../agent/agent.js';
 import type { Config } from '../config.js';
+import type { GmailSync } from '../gmail/sync.js';
 import { AppError, HTTP_STATUS } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import { createMcpServer, SERVER_NAME, SERVER_VERSION } from '../mcp/server.js';
 import type { ObligationService } from '../service/obligations.js';
 import { createAgentRouter } from './agent.js';
 import { bearerAuth, requestContext } from './context.js';
+import { createGmailRouter, createGoogleAuthRouter } from './google.js';
 import { createRestRouter } from './rest.js';
 
 export interface AppDeps {
@@ -21,6 +23,8 @@ export interface AppDeps {
   logger: Logger;
   /** Powers /agent for the Echo Show simulator; without it those routes say it isn't set up. */
   agent?: Agent;
+  /** Gmail sync: /auth/google, /api/gmail and the sync_inbox tool. Without it the tool says it isn't set up. */
+  gmail?: GmailSync;
 }
 
 const csv = (s: string | undefined) => (s ?? '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -30,7 +34,7 @@ const JSON_BODY_LIMIT = '12mb';
 
 const jsonRpcError = (code: number, message: string) => ({ jsonrpc: '2.0' as const, error: { code, message }, id: null });
 
-export function createApp({ config, service, logger, agent }: AppDeps): Express {
+export function createApp({ config, service, logger, agent, gmail }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
 
@@ -51,7 +55,7 @@ export function createApp({ config, service, logger, agent }: AppDeps): Express 
   // --- MCP: Streamable HTTP, stateless (a fresh server + transport per request).
   app.post('/mcp', async (req, res) => {
     const ctx = requestContext(req, config.DEFAULT_HOUSEHOLD_ID);
-    const server = createMcpServer(service, ctx, logger);
+    const server = createMcpServer(service, ctx, logger, gmail);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => {
       void transport.close();
@@ -74,6 +78,11 @@ export function createApp({ config, service, logger, agent }: AppDeps): Express 
   app.delete('/mcp', methodNotAllowed);
 
   // --- REST for the web app.
+  if (gmail) {
+    app.use('/api/gmail', createGmailRouter(gmail, config.DEFAULT_HOUSEHOLD_ID));
+    // Browser navigations to and from Google's consent page, so outside bearer auth.
+    app.use('/auth', createGoogleAuthRouter(gmail, logger, csv(config.CORS_ORIGINS).find((o) => o !== '*')));
+  }
   app.use('/api', createRestRouter(service, config.DEFAULT_HOUSEHOLD_ID));
 
   // --- The simulator's assistant, an MCP client of /mcp above.

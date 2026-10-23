@@ -43,6 +43,15 @@ const EnvSchema = z.object({
   AGENT_MCP_URL: z.string().url().optional(),
   /** Model answers are cached here by content hash, so the same document is never sent twice. */
   EXTRACTION_CACHE_DIR: z.string().default(path.join(packageRoot, '.data', 'extraction-cache')),
+  /** Google OAuth client (Web application) for Gmail sync. Without both, sync reports it isn't set up. */
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+  /** Must match an authorised redirect URI on the client. Defaults to http://localhost:PORT/auth/google/callback. */
+  GOOGLE_REDIRECT_URI: z.string().url().optional(),
+  /** Gmail refresh token and the ids of emails already handled. */
+  GMAIL_STATE_FILE: z.string().default(path.join(packageRoot, '.data', 'gmail.json')),
+  /** Emails sent to extraction per sync, at most (one model call each, unless cached). */
+  GMAIL_SYNC_MAX_EMAILS: z.coerce.number().int().min(1).max(20).default(5),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

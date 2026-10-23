@@ -12,6 +12,7 @@ import {
   type GetSourceResult,
   type IngestResult,
   type Obligation,
+  type SyncInboxResult,
   type WhatsDueResult,
 } from '@fridge-door/shared';
 import { AppError } from '../lib/errors.js';
@@ -49,8 +50,8 @@ const MAX_STEPS = 5;
 const MAX_HISTORY = 30;
 const SESSION_TTL_MS = 30 * 60_000;
 const MAX_SESSIONS = 500;
-/** Reading a photo is two model calls (transcribe, extract); the SDK's default is 60s. */
-const TOOL_TIMEOUT_MS = 150_000;
+/** Reading a photo is two model calls and an inbox sync up to five; the SDK's default is 60s. */
+const TOOL_TIMEOUT_MS = 240_000;
 /** Photos come from the camera button (AgentActionInput), never from the model. */
 const HIDDEN_TOOLS = new Set(['ingest_image']);
 
@@ -264,6 +265,7 @@ USING THE TOOLS
 - "What's due", "anything to pay", "what's coming up": whats_due (range today, week or month). "What's next": next_up.
 - "I paid / signed / booked X": mark_done with doneBy set to the speaker. Only mark something done when it is clear which single item they mean. If a tool reports several matches, or the request could fit more than one item, ask which one. Never guess.
 - "What did the email / notice / message say", "where did that come from": always call get_source, which shows the original text on screen. It needs an id, so if you don't have one yet, call whats_due with range "month" first and pick the item by title and source (a school notice is usually a photo or an email). Then summarise the quote in one sentence.
+- "Check my email", "anything new in my inbox": sync_inbox. Say how many emails it read and what it found, using its speech.
 - "Did anyone ...", "who paid ...": who_handled.
 - "Remind us ...": add_obligation, with the speaker's own words as sourceSnippet and the date resolved to YYYY-MM-DD.
 - When a result lists needsConfirmation, ask its question. When they answer, call confirm_item with the item id and the date they chose as YYYY-MM-DD.
@@ -292,6 +294,9 @@ export function cardFor(tool: string, out: ToolOutput, lookup: (id: string) => O
   switch (tool) {
     case 'whats_due':
       return { kind: 'due', result: d as unknown as WhatsDueResult };
+    case 'sync_inbox':
+      // Nothing read means nothing to show; the speech says so.
+      return (d as unknown as SyncInboxResult).emails.read > 0 ? { kind: 'ingest', result: d as unknown as SyncInboxResult } : null;
     case 'ingest_text':
     case 'ingest_image':
       return { kind: 'ingest', result: d as unknown as IngestResult };

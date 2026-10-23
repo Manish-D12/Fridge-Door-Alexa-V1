@@ -40,6 +40,7 @@ const dataDir = await mkdtemp(path.join(tmpdir(), 'fridge-door-samples-'));
 // The seed script reads its target from the environment; point it at a temp file.
 process.env.STORAGE = 'local';
 process.env.LOCAL_DATA_FILE = path.join(dataDir, 'obligations.json');
+process.env.GMAIL_STATE_FILE = path.join(dataDir, 'gmail.json');
 const config = loadConfig();
 console.log('--- Seeding demo household ---');
 await import('./seed.js');

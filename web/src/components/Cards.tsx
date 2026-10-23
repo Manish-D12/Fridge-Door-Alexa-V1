@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AgentCard, GetSourceResult, IngestResult, Obligation, WhatsDueResult } from '@fridge-door/shared';
+import type { AgentCard, GetSourceResult, IngestResult, Obligation, SyncInboxResult, WhatsDueResult } from '@fridge-door/shared';
 import { CalendarCheck, CircleAlert, CircleCheck, CircleHelp, Lock, Quote, ShieldCheck, Sparkles } from 'lucide-react';
 import { ago, isOverdue, money, plainDate, SOURCE_NOUN, TYPE_LABEL, when, whenText } from '../format';
 import { SOURCE_ICON, TypeIcon } from './TypeIcon';
@@ -223,8 +223,11 @@ function IngestCard({ result, tz, now, actions }: { result: IngestResult; tz: st
   const pending = new Set(result.needsConfirmation.map((n) => n.id));
   const heading =
     result.items.length === 0 ? 'Nothing new found' : `Found ${result.items.length} ${result.items.length === 1 ? 'thing' : 'things'}`;
+  // An inbox sync (sync_inbox) says how many emails it read.
+  const emails = (result as Partial<SyncInboxResult>).emails;
+  const from = emails ? `from ${emails.read} new email${emails.read === 1 ? '' : 's'}` : `from your ${SOURCE_NOUN[result.source]}`;
   return (
-    <Panel icon={<Icon size={20} />} heading={heading} aside={<span className="text-[16px] text-white/50">from your {SOURCE_NOUN[result.source]}</span>}>
+    <Panel icon={<Icon size={20} />} heading={heading} aside={<span className="text-[16px] text-white/50">{from}</span>}>
       <div className="flex flex-col gap-3">
         {result.needsConfirmation.map((n) => (
           <ConfirmBlock key={n.id} question={n.question} options={n.options} onPick={(d) => actions.confirm(n.id, d)} />

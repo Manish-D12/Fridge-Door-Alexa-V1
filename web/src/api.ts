@@ -1,7 +1,9 @@
-import type { AgentActionInput, AgentReply, WhatsDueResult } from '@fridge-door/shared';
+import type { AgentActionInput, AgentReply, GmailStatus, WhatsDueResult } from '@fridge-door/shared';
 
 export const API_URL = (import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:3000').replace(/\/$/, '');
 const API_KEY: string | undefined = import.meta.env.VITE_API_KEY || undefined;
+/** Opened in a new tab: the server sends it on to Google's consent page. */
+export const GMAIL_CONNECT_URL = `${API_URL}/auth/google`;
 
 export class ApiError extends Error {}
 
@@ -29,4 +31,6 @@ export const api = {
 
   /** Everything pending in the next 30 days plus anything overdue, for the idle screen. */
   comingUp: (member: string) => request<WhatsDueResult>('/api/obligations/due?range=month', member),
+
+  gmailStatus: (member: string) => request<GmailStatus>('/api/gmail/status', member),
 };

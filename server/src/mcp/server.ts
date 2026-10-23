@@ -14,11 +14,14 @@ import {
   MarkDoneResult,
   NextUpInput,
   NextUpResult,
+  SyncInboxInput,
+  SyncInboxResult,
   WhatsDueInput,
   WhatsDueResult,
   WhoHandledInput,
   WhoHandledResult,
 } from '@fridge-door/shared';
+import type { GmailSync } from '../gmail/sync.js';
 import { AppError } from '../lib/errors.js';
 import type { Logger } from '../lib/logger.js';
 import type { ObligationService, RequestContext } from '../service/obligations.js';
@@ -30,7 +33,7 @@ const INSTRUCTIONS = `fridge-door is the household's shared list of obligations:
 Every tool result has a "speech" field: a short sentence written to be read aloud. Prefer reading it as-is.
 Never read ids aloud; keep them to pass to later calls (mark_done, who_handled, get_source, confirm_item).
 If a tool reports several matches, ask the person which one they meant rather than guessing.
-When ingest_text or ingest_image returns needsConfirmation items, ask each question and pass the answer to confirm_item.
+When ingest_text, ingest_image or sync_inbox returns needsConfirmation items, ask each question and pass the answer to confirm_item.
 Some items are private to the person who added them; they are filtered out automatically when someone else asks.`;
 
 type Handler<I> = (input: I) => Promise<{ speech: string } & Record<string, unknown>>;
@@ -39,7 +42,7 @@ type Handler<I> = (input: I) => Promise<{ speech: string } & Record<string, unkn
  * Builds an MCP server bound to one request's identity. In stateless
  * Streamable HTTP mode a fresh server is created for every POST /mcp.
  */
-export function createMcpServer(service: ObligationService, ctx: RequestContext, logger: Logger): McpServer {
+export function createMcpServer(service: ObligationService, ctx: RequestContext, logger: Logger, gmail?: GmailSync): McpServer {
   const server = new McpServer(
     { name: SERVER_NAME, title: 'Fridge Door', version: SERVER_VERSION },
     { instructions: INSTRUCTIONS },
@@ -191,11 +194,29 @@ export function createMcpServer(service: ObligationService, ctx: RequestContext,
   );
 
   server.registerTool(
+    'sync_inbox',
+    {
+      title: 'Check email',
+      description:
+        "Check the household's connected Gmail for new bills, invoices, orders, deliveries, bookings, appointments, renewals and school emails from the last 14 days, and add what they contain. " +
+        'Use for "check my email", "anything new in my inbox?". Emails read by an earlier check are skipped, and at most 5 are read per check. ' +
+        'If the result lists needsConfirmation items, ask each question and call confirm_item. If Gmail is not connected, say to connect it in the settings on the screen.',
+      inputSchema: SyncInboxInput,
+      outputSchema: SyncInboxResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    run('sync_inbox', () => {
+      if (!gmail) throw new AppError('internal', "Gmail isn't set up on this server.");
+      return gmail.sync(ctx);
+    }),
+  );
+
+  server.registerTool(
     'confirm_item',
     {
       title: 'Confirm item date',
       description:
-        'Settle the date of an item that ingest_text or ingest_image flagged with needsConfirmation, after asking the person its question ' +
+        'Settle the date of an item that ingest_text, ingest_image or sync_inbox flagged with needsConfirmation, after asking the person its question ' +
         '(e.g. "Is the bake sale on October 11 or November 10?"). Pass the item id and the date they chose; this clears the flag.',
       inputSchema: ConfirmItemInput,
       outputSchema: ConfirmItemResult,

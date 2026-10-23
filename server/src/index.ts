@@ -3,6 +3,8 @@ import { loadConfig } from './config.js';
 import { createApp } from './http/app.js';
 import { FileExtractionCache } from './extract/cache.js';
 import { Extractor } from './extract/extractor.js';
+import { GmailState } from './gmail/state.js';
+import { GmailSync } from './gmail/sync.js';
 import { createLogger } from './lib/logger.js';
 import { createLlmProvider } from './llm/index.js';
 import { ObligationService } from './service/obligations.js';
@@ -38,7 +40,22 @@ const service = new ObligationService(store, {
   extractor,
 });
 
-const app = createApp({ config, service, logger, agent });
+const gmail = new GmailSync({
+  oauth:
+    config.GOOGLE_CLIENT_ID && config.GOOGLE_CLIENT_SECRET
+      ? {
+          clientId: config.GOOGLE_CLIENT_ID,
+          clientSecret: config.GOOGLE_CLIENT_SECRET,
+          redirectUri: config.GOOGLE_REDIRECT_URI ?? `http://localhost:${config.PORT}/auth/google/callback`,
+        }
+      : undefined,
+  state: new GmailState(config.GMAIL_STATE_FILE),
+  service,
+  logger,
+  maxEmails: config.GMAIL_SYNC_MAX_EMAILS,
+});
+
+const app = createApp({ config, service, logger, agent, gmail });
 
 const server = app.listen(config.PORT, config.HOST, () => {
   logger.info('fridge-door listening', {
@@ -49,6 +66,7 @@ const server = app.listen(config.PORT, config.HOST, () => {
     extraction: extractor?.providerName ?? 'disabled',
     extractionCache: extractor ? config.EXTRACTION_CACHE_DIR : undefined,
     agent: agent ? `http://${config.HOST}:${config.PORT}/agent` : 'disabled',
+    gmail: gmail.configured ? `http://localhost:${config.PORT}/auth/google` : 'not set up',
     auth: config.API_KEY ? 'bearer' : 'none',
   });
 });

@@ -6,9 +6,14 @@
  * Dates are relative to "now" in HOUSEHOLD_TIMEZONE so the demo always has
  * something due today/tomorrow/this week, and each sourceSnippet quotes the
  * same dates as its dueDate.
+ *
+ * A reset also forgets which emails Gmail sync has read (the connection stays),
+ * so "check my email" finds them again. Their extraction is cached, so that
+ * costs no model calls.
  */
 import { ObligationSchema, type Obligation } from '@fridge-door/shared';
 import { loadConfig } from '../src/config.js';
+import { GmailState } from '../src/gmail/state.js';
 import { addLocalDays, endOfLocalDay, localDateOf, zonedTimeToInstant } from '../src/lib/time.js';
 import { createStore } from '../src/store/index.js';
 
@@ -228,6 +233,11 @@ try {
   if (reset) {
     const removed = await store.clearHousehold(householdId);
     console.log(`Cleared ${removed} existing item(s) from household "${householdId}".`);
+    const gmail = await new GmailState(config.GMAIL_STATE_FILE).update((g) => {
+      g.processed = {};
+      g.lastSyncAt = null;
+    });
+    if (gmail.refreshToken) console.log(`Gmail (${gmail.account}) stays connected; the next sync reads recent emails again.`);
   }
   for (const o of obligations) await store.put(o);
   console.log(`Seeded ${obligations.length} obligations into ${store.describe()} for household "${householdId}" (${tz}):`);

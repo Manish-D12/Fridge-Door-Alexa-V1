@@ -271,6 +271,36 @@ export const IngestResult = z.object({
 });
 export type IngestResult = z.infer<typeof IngestResult>;
 
+// ---------------------------------------------------------------------------
+// Gmail
+// ---------------------------------------------------------------------------
+
+export const SyncInboxInput = z.object({});
+export type SyncInboxInput = z.infer<typeof SyncInboxInput>;
+
+/** An ingest result over every email read in one sync, plus what happened to the rest. */
+export const SyncInboxResult = IngestResult.extend({
+  account: z.string().nullable().describe('The connected Gmail address.'),
+  emails: z.object({
+    matched: z.number().int().describe('Recent emails matching the search.'),
+    alreadyRead: z.number().int().describe('Skipped: read by an earlier sync.'),
+    notRelevant: z.number().int().describe('Skipped by the keyword check, without calling the model.'),
+    read: z.number().int().describe('Sent to extraction this time.'),
+    remaining: z.number().int().describe('Relevant but over the per-sync limit; the next sync reads them.'),
+  }),
+});
+export type SyncInboxResult = z.infer<typeof SyncInboxResult>;
+
+export const GmailStatus = z.object({
+  /** Google OAuth client settings are present on the server. */
+  configured: z.boolean(),
+  connected: z.boolean(),
+  account: z.string().nullable(),
+  connectedAt: IsoDateTime.nullable(),
+  lastSyncAt: IsoDateTime.nullable(),
+});
+export type GmailStatus = z.infer<typeof GmailStatus>;
+
 export const ListObligationsResult = z.object({
   items: z.array(ObligationSchema),
 });

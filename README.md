@@ -109,6 +109,7 @@ All settings are environment variables, documented in [`.env.example`](.env.exam
 | `ingest_text` | `text`, `source` | Extracts dated obligations from an email or message, skips ones already on the list, and adds the rest |
 | `ingest_image` | `base64`, `mimeType` | Checks the file signature, transcribes the photo, then extracts from the transcript like `ingest_text` |
 | `confirm_item` | `id`, `chosenDate` | Settles an item that ingest flagged with `needsConfirmation` (e.g. "10/11") |
+| `sync_inbox` | none | Reads up to 5 new emails from the connected Gmail into the list (see "Gmail sync") |
 
 ### Extraction
 
@@ -178,6 +179,9 @@ These endpoints use the same service, validation and identity headers as the MCP
 | POST | `/api/obligations/confirm` | `{ id, chosenDate }` |
 | POST | `/api/ingest/text` | `{ text, source }` |
 | POST | `/api/ingest/image` | `{ base64, mimeType }` |
+| GET | `/api/gmail/status` | `{ configured, connected, account, connectedAt, lastSyncAt }` |
+| POST | `/api/gmail/sync` | Same as the `sync_inbox` tool |
+| GET | `/auth/google` | Starts Google consent for Gmail (browser; no bearer token) |
 | POST | `/agent/chat` | `{ message, sessionId? }` → `{ speech, card, sessionId, toolCalls }` (simulator) |
 | POST | `/agent/action` | `{ tool: "ingest_image" | "confirm_item", arguments, sessionId? }` (simulator buttons) |
 | GET | `/healthz` | Liveness check (no auth) |
@@ -289,6 +293,7 @@ Open **http://localhost:5173** in Chrome or Edge, which have Web Speech recognit
 | *"What did the school notice say?"* | The item, with the original text quoted in a "From your photo" box |
 | Camera button → snap or **Upload photo** (try `samples/07-science-fair-notice.jpg`) | "Reading your photo…", then a card of what was added |
 | A document with an ambiguous date, such as `samples/05-ambiguous-date.txt` | A question with one button per date; tapping one confirms it in place |
+| *"Check my email"* (after Settings → Connect Gmail) | A card of what was found in up to 5 new emails; see "Gmail sync" below |
 | Switch **Mom / Dad / Riya** (top right) | A new conversation as that person; Mom (Priya) sees her private credit card bill, the others don't |
 
 The chips under the device send the example questions without a microphone. The keyboard button
@@ -300,6 +305,31 @@ The members are defined in `web/src/members.ts`. Mom and Dad send the names used
 (Priya and Dan), so their private items and `doneBy` line up. Set `VITE_API_URL` (default
 `http://127.0.0.1:3000`) or `VITE_API_KEY` in `web/.env` if the server runs elsewhere or has
 `API_KEY` set.
+
+### Gmail sync
+
+Settings (the gear, top right) → **Connect Gmail** opens `/auth/google` in a new tab. It asks for
+`gmail.readonly` only; the callback (`/auth/google/callback`, protected by a one-time `state`)
+stores the refresh token in `server/.data/gmail.json`. Then say *"Alexa, check my email"*: the agent
+calls the `sync_inbox` MCP tool, which does this:
+
+1. Searches Gmail for the last 14 days, skipping Promotions and Social, for bill, invoice, due,
+   appointment, booking, confirmation, order, delivery, renewal, reminder and school.
+2. Skips ids an earlier sync already handled. They are stored in `gmail.json`.
+3. Rules out the rest with keyword checks, **without a model call**. An email needs an obligation
+   word and a date or amount. Security codes, sign-in alerts and marketing subjects are ruled out.
+4. Sends at most 5 emails to the extractor, one at a time, as `Subject/From/Date` plus the
+   plain-text body (`source: gmail`). Snippets are checked against that text as usual. The
+   extraction cache means the same email content never reaches the model twice.
+
+So one sync costs at most 5 Gemini requests, or fewer when emails are cached or ruled out; the server
+log counts each request. If the model gives out part way, what was read is kept and the rest is
+retried next time. `npm run seed` forgets which emails were read but keeps the connection, so
+after a reset "check my email" finds them again, answered from the cache.
+
+To use your own client, create an OAuth client of type *Web application*, enable the Gmail API, add
+`http://localhost:3000/auth/google/callback` as a redirect URI and your account as a test user, then
+set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REDIRECT_URI` in `server/.env`.
 
 ## Connecting to Alexa+
 

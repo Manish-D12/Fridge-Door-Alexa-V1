@@ -7,6 +7,7 @@ import { CameraSheet, type Photo } from './components/CameraSheet';
 import { Device } from './components/Device';
 import { IdleScreen } from './components/IdleScreen';
 import { LightBar, type Phase } from './components/LightBar';
+import { SettingsMenu } from './components/Settings';
 import { clock } from './format';
 import { loadMemberIndex, MEMBERS, saveMemberIndex } from './members';
 import { earcon, speak, stopSpeaking, useRecognition } from './voice';
@@ -17,7 +18,7 @@ const DISMISS_MS = 25_000;
 /** A press shorter than this is a tap (listen until silence) rather than push-to-talk. */
 const TAP_MS = 300;
 
-const EXAMPLES = ["What's due this week?", 'I paid the water bill', 'What did the school notice say?', "When's the next delivery?"];
+const EXAMPLES = ["What's due this week?", 'I paid the water bill', 'What did the school notice say?', "When's the next delivery?", 'Check my email'];
 
 interface Exchange {
   /** What the person said, or null for a photo. */
@@ -270,6 +271,7 @@ export default function App() {
               </span>
             )}
             <Wifi size={20} className="text-white/55" />
+            <SettingsMenu member={member.name} />
             <MemberSwitcher index={memberIndex} onChange={switchMember} />
           </div>
         </div>

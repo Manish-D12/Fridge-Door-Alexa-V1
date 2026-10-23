@@ -111,6 +111,14 @@ interface IngestMeta {
   source: Source;
   transcript: string | null;
   now: number;
+  /** What "nothing found" refers to; defaults to "that photo" or "that". */
+  subject?: string;
+}
+
+interface Saved {
+  added: Obligation[];
+  duplicates: Obligation[];
+  skipped: IngestResult['skipped'];
 }
 
 export function sameName(a: string | null | undefined, b: string | null | undefined): boolean {
@@ -275,7 +283,43 @@ export class ObligationService {
     const extractor = this.requireExtractor();
     const now = this.now();
     const extracted = await reading(() => extractor.extract(input.text, { sourceDescription: SOURCE_PHRASE[input.source], now }));
-    return this.saveExtracted(ctx, extracted, { kind: 'text', source: input.source, transcript: null, now });
+    const meta = { kind: 'text' as const, source: input.source, transcript: null, now };
+    return this.ingestResult(await this.saveExtracted(ctx, extracted, meta), meta);
+  }
+
+  /**
+   * Several emails at once (an inbox sync), answered with one result. Each is
+   * extracted on its own, so snippets quote that email and the cache works per
+   * email. `onSaved(i)` runs once email i is saved. If the model fails part way,
+   * what was saved stays and `read` says how many got through; a failure on
+   * the first email is thrown.
+   */
+  async ingestEmails(
+    ctx: RequestContext,
+    emails: string[],
+    onSaved: (index: number) => Promise<void> = async () => undefined,
+  ): Promise<{ result: IngestResult; read: number }> {
+    const extractor = this.requireExtractor();
+    const now = this.now();
+    const meta: IngestMeta = { kind: 'text', source: 'gmail', transcript: null, now, subject: emails.length === 1 ? 'that email' : 'those emails' };
+    const all: Saved = { added: [], duplicates: [], skipped: [] };
+    let read = 0;
+    for (const [i, text] of emails.entries()) {
+      let extracted: ExtractionResult;
+      try {
+        extracted = await reading(() => extractor.extract(text, { sourceDescription: SOURCE_PHRASE.gmail, now }));
+      } catch (err) {
+        if (read === 0) throw err;
+        break;
+      }
+      const saved = await this.saveExtracted(ctx, extracted, meta);
+      all.added.push(...saved.added);
+      all.duplicates.push(...saved.duplicates);
+      all.skipped.push(...saved.skipped);
+      read++;
+      await onSaved(i);
+    }
+    return { result: this.ingestResult(all, meta), read };
   }
 
   /** Transcribes the photo first, so every sourceSnippet quotes real text from it. */
@@ -290,10 +334,10 @@ export class ObligationService {
     const transcript = await reading(() => extractor.transcribe({ bytes, mimeType: input.mimeType }));
     const meta = { kind: 'image' as const, source: 'photo' as const, transcript, now };
     if (!transcript) {
-      return { ...this.ingestResult([], [], [], meta), speech: "I couldn't read any text in that photo." };
+      return { ...this.ingestResult({ added: [], duplicates: [], skipped: [] }, meta), speech: "I couldn't read any text in that photo." };
     }
     const extracted = await reading(() => extractor.extract(transcript, { sourceDescription: 'text transcribed from a photo', now }));
-    return this.saveExtracted(ctx, extracted, meta);
+    return this.ingestResult(await this.saveExtracted(ctx, extracted, meta), meta);
   }
 
   async confirmItem(ctx: RequestContext, input: ConfirmItemInput): Promise<ConfirmItemResult> {
@@ -372,7 +416,7 @@ export class ObligationService {
     ctx: RequestContext,
     extracted: ExtractionResult,
     meta: IngestMeta,
-  ): Promise<IngestResult> {
+  ): Promise<Saved> {
     const known = await this.visible(ctx);
     const added: Obligation[] = [];
     const duplicates: { item: ExtractedObligation; existing: Obligation }[] = [];
@@ -399,10 +443,10 @@ export class ObligationService {
       ...duplicates.map(({ item, existing }) => ({ title: item.title, reason: 'duplicate' as const, existingId: existing.id })),
       ...extracted.rejected.map((r) => ({ title: r.title, reason: r.reason, existingId: null })),
     ];
-    return this.ingestResult(added, duplicates.map((d) => d.existing), skipped, meta);
+    return { added, duplicates: duplicates.map((d) => d.existing), skipped };
   }
 
-  private ingestResult(added: Obligation[], duplicates: Obligation[], skipped: IngestResult['skipped'], meta: IngestMeta): IngestResult {
+  private ingestResult({ added, duplicates, skipped }: Saved, meta: IngestMeta): IngestResult {
     const { now } = meta;
     const confirm = added.filter((o) => o.needsConfirmation && o.confirmationQuestion);
     const parts: string[] = [];
@@ -419,7 +463,7 @@ export class ObligationService {
       parts.push(added.length > 0 ? `${titles} ${verb} already on the list.` : `I found ${titles}, but ${duplicates.length === 1 ? 'it was' : 'they were'} already on the list.`);
     }
     if (parts.length === 0) {
-      parts.push(`I didn't find anything with a date to keep track of in ${meta.kind === 'image' ? 'that photo' : 'that'}.`);
+      parts.push(`I didn't find anything with a date to keep track of in ${meta.subject ?? (meta.kind === 'image' ? 'that photo' : 'that')}.`);
     }
     if (confirm.length > 0) {
       parts.push(confirm.length === 1 ? 'One needs checking.' : `${confirm.length} need checking.`);

@@ -83,7 +83,7 @@ describe('agent (MCP client)', () => {
 
     const [first, second] = model.chatRequests;
     assert.deepEqual(first!.tools.map((t) => t.name).sort(), [
-      'add_obligation', 'confirm_item', 'get_source', 'ingest_text', 'mark_done', 'next_up', 'whats_due', 'who_handled',
+      'add_obligation', 'confirm_item', 'get_source', 'ingest_text', 'mark_done', 'next_up', 'sync_inbox', 'whats_due', 'who_handled',
     ]);
     assert.ok(!('$schema' in first!.tools[0]!.parameters));
     assert.match(first!.system, /The person speaking is Priya/);

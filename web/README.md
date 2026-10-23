@@ -8,7 +8,7 @@ to the server's `/agent` (the Alexa+ brain, an MCP client of `/mcp`) and `/api` 
 src/
 ├── App.tsx              state machine: idle → listening → thinking → speaking; push-to-talk, member switcher
 ├── voice.ts             Web Speech recognition (en-US), speechSynthesis, the listening earcon
-├── api.ts               /agent/chat, /agent/action, /api/obligations/due (X-Household-Member header)
+├── api.ts               /agent/chat, /agent/action, /api/obligations/due, /api/gmail/status (X-Household-Member header)
 ├── format.ts            dates in the household time zone, money, labels
 ├── members.ts           Mom (Priya), Dad (Dan), Riya
 └── components/
@@ -16,7 +16,8 @@ src/
     ├── IdleScreen.tsx   clock, date, rotating "Coming up"
     ├── LightBar.tsx     the Alexa light bar
     ├── Cards.tsx        due list, item, quoted source, ingest result, date confirmation, choices
-    └── CameraSheet.tsx  getUserMedia snap or file upload, downscaled to JPEG
+    ├── CameraSheet.tsx  getUserMedia snap or file upload, downscaled to JPEG
+    └── Settings.tsx     the gear menu: Connect Gmail and its status
 ```
 
 `npm run dev` from the repo root starts this and the server together. Settings (`web/.env`):
