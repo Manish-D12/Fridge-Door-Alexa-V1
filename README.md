@@ -58,7 +58,7 @@ delivery. It's the household's real shared to-do list. It works because everyone
 and it fails because nobody can ask it anything. An Echo Show in the same kitchen could be that
 fridge door, and could do something about what's on it.
 
-Due to some issues we couldnt upload it on time though the porject was finished before hand.
+Due to some issues we couldnt upload it on time though the project was finished before hand.
 
 ---
 
